@@ -125,7 +125,19 @@ final class OneShotHttpGet {
         if ("chunked".equalsIgnoreCase(responseHeaders.get("transfer-encoding"))) {
             body = readChunked(in);
         } else if (responseHeaders.containsKey("content-length")) {
-            body = in.readNBytes(Integer.parseInt(responseHeaders.get("content-length")));
+            int contentLength;
+            try {
+                contentLength = Integer.parseInt(responseHeaders.get("content-length"));
+            } catch (NumberFormatException e) {
+                throw new IOException("Malformed Content-Length: " + responseHeaders.get("content-length"), e);
+            }
+            if (contentLength < 0) {
+                throw new IOException("Negative Content-Length: " + contentLength);
+            }
+            body = in.readNBytes(contentLength);
+            if (body.length != contentLength) {
+                throw new IOException("Truncated body: expected " + contentLength + " bytes, got " + body.length);
+            }
         } else {
             body = in.readAllBytes();
         }
@@ -140,11 +152,23 @@ final class OneShotHttpGet {
                 throw new IOException("Truncated chunked body");
             }
             int semicolon = sizeLine.indexOf(';');
-            int size = Integer.parseInt((semicolon < 0 ? sizeLine : sizeLine.substring(0, semicolon)).strip(), 16);
+            int size;
+            try {
+                size = Integer.parseInt((semicolon < 0 ? sizeLine : sizeLine.substring(0, semicolon)).strip(), 16);
+            } catch (NumberFormatException e) {
+                throw new IOException("Malformed chunk size: " + sizeLine, e);
+            }
+            if (size < 0) {
+                throw new IOException("Negative chunk size: " + size);
+            }
             if (size == 0) {
                 return body.toByteArray();
             }
-            body.write(in.readNBytes(size));
+            byte[] chunk = in.readNBytes(size);
+            if (chunk.length != size) {
+                throw new IOException("Truncated chunk: expected " + size + " bytes, got " + chunk.length);
+            }
+            body.write(chunk);
             readLine(in);
         }
     }

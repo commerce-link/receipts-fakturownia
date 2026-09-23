@@ -195,6 +195,45 @@ class OneShotHttpGetTest {
         assertEquals(FakturowniaApiException.Kind.NOT_SENT, failure.kind());
     }
 
+    @Test
+    void truncatedContentLengthBodyIsSentNoAnswer() throws IOException {
+        // given
+        int port = rawServer("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort", new AtomicInteger(), new CopyOnWriteArrayList<>());
+
+        // when
+        FakturowniaApiException failure = assertThrows(FakturowniaApiException.class,
+                () -> client.get(URI.create("http://127.0.0.1:" + port + "/x"), Map.of()));
+
+        // then
+        assertEquals(FakturowniaApiException.Kind.SENT_NO_ANSWER, failure.kind());
+    }
+
+    @Test
+    void malformedContentLengthIsSentNoAnswer() throws IOException {
+        // given
+        int port = rawServer("HTTP/1.1 200 OK\r\nContent-Length: ten\r\n\r\nOK", new AtomicInteger(), new CopyOnWriteArrayList<>());
+
+        // when
+        FakturowniaApiException failure = assertThrows(FakturowniaApiException.class,
+                () -> client.get(URI.create("http://127.0.0.1:" + port + "/x"), Map.of()));
+
+        // then
+        assertEquals(FakturowniaApiException.Kind.SENT_NO_ANSWER, failure.kind());
+    }
+
+    @Test
+    void malformedChunkSizeIsSentNoAnswer() throws IOException {
+        // given
+        int port = rawServer("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n", new AtomicInteger(), new CopyOnWriteArrayList<>());
+
+        // when
+        FakturowniaApiException failure = assertThrows(FakturowniaApiException.class,
+                () -> client.get(URI.create("http://127.0.0.1:" + port + "/x"), Map.of()));
+
+        // then
+        assertEquals(FakturowniaApiException.Kind.SENT_NO_ANSWER, failure.kind());
+    }
+
     // ---- TLS ---------------------------------------------------------------------------------------------
 
     /** Self-signed certificate for {@code localhost} only, generated with the JDK's keytool. */
