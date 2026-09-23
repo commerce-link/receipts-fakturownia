@@ -1,0 +1,13 @@
+name: Publish to GitHub Packages
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  call-shared-workflow:
+    uses: commerce-link/.github/.github/workflows/maven-publish.yml@main
+    permissions:
+      contents: read
+      packages: write

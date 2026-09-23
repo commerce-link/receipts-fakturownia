@@ -1,0 +1,16 @@
+name: Test on PR
+
+on:
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: test-on-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  call-shared-workflow:
+    permissions:
+      contents: read
+      packages: read
+    uses: commerce-link/.github/.github/workflows/maven-test.yml@main
