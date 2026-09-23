@@ -122,8 +122,23 @@ final class FakeFakturownia implements AutoCloseable {
     /** The printer fiscalised the sale and the hub issued the e-receipt. */
     synchronized void settleFiscalised(String id) {
         ObjectNode invoice = require(id);
+        invoice.put("fiscal_status", "er_printed");
         invoice.put("e_receipt_view_url", "https://test.paragony.pl/eR" + id);
-        invoice.put("print_time", "2026-09-22T12:05:00.000+02:00");
+        invoice.put("updated_at", "2026-09-22T12:05:01.000+02:00");
+    }
+
+    /** The printer reached this fiscal status (e.g. {@code er_fatal}: fiscalised on paper, no e-receipt link). */
+    synchronized void settleFiscalStatus(String id, String status) {
+        ObjectNode invoice = require(id);
+        invoice.put("fiscal_status", status);
+        invoice.put("updated_at", "2026-09-22T12:05:01.000+02:00");
+    }
+
+    /** The printer refused the sale; Fakturownia keeps its message in {@code fiscal_print_error}. */
+    synchronized void settleFiscalError(String id, String message) {
+        ObjectNode invoice = require(id);
+        invoice.put("fiscal_status", "error");
+        invoice.put("fiscal_print_error", message);
         invoice.put("updated_at", "2026-09-22T12:05:01.000+02:00");
     }
 

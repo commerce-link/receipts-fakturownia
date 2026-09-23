@@ -597,7 +597,7 @@ class FakturowniaReceiptProviderTest {
         assertEquals(ReceiptState.FISCALISED, fetched.state());
         assertNull(fetched.fiscal().receiptNumber());
         assertNull(fetched.fiscal().cashRegisterUniqueNumber());
-        assertEquals(java.time.Instant.parse("2026-09-22T10:05:00Z"), fetched.fiscal().fiscalisedAt());
+        assertEquals(java.time.Instant.parse("2026-09-22T10:05:01Z"), fetched.fiscal().fiscalisedAt());
     }
 
     @Test

@@ -35,7 +35,7 @@ class FakturowniaReceiptProviderContractTest extends ReceiptProviderContractTest
     protected void settle(Receipt pending, ReceiptState target) {
         switch (target) {
             case FISCALISED -> fake.settleFiscalised(pending.providerReceiptId());
-            case FAILED -> fake.settleCancelled(pending.providerReceiptId());
+            case FAILED -> fake.settleFiscalError(pending.providerReceiptId(), "Niepoprawna wartość brutto na dokumencie");
             default -> throw new IllegalArgumentException("Cannot settle to " + target);
         }
     }

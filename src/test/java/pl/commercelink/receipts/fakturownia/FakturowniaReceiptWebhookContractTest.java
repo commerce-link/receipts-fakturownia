@@ -44,8 +44,9 @@ class FakturowniaReceiptWebhookContractTest extends ReceiptWebhookContractTest {
                 .put("department_id", FakeFakturownia.DEPARTMENT_ID)
                 .put("status", receipt.state() == ReceiptState.FAILED ? "rejected" : "paid");
         if (receipt.state() == ReceiptState.FISCALISED) {
+            document.put("fiscal_status", "er_printed");
             document.put("e_receipt_view_url", receipt.documentUrl());
-            document.put("print_time", receipt.fiscal().fiscalisedAt().atOffset(ZoneOffset.ofHours(2)).toString());
+            document.put("updated_at", receipt.fiscal().fiscalisedAt().atOffset(ZoneOffset.ofHours(2)).toString());
         }
         fake.putInvoice(document);
         return webhookAbout(receipt.providerReceiptId(), "receipt", FakturowniaTestSupport.WEBHOOK_TOKEN);

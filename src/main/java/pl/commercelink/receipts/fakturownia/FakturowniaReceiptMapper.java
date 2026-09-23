@@ -34,6 +34,16 @@ final class FakturowniaReceiptMapper {
     /** Written to {@code internal_note} right before fiscalisation is ordered; its presence means "never order again". */
     static final String FISCAL_PRINT_MARKER = "commercelink:fiscal-print-ordered";
 
+    /**
+     * {@code fiscal_status} values meaning the printer registered the sale (Fakturownia help, "Pytania dotyczące
+     * integracji … architektury fiskalizacji online"): paper receipt, e-receipt, e-receipt still being retried,
+     * e-receipt given up. Every one of them is final: the sale is in the printer's fiscal memory.
+     */
+    private static final Set<String> FISCALISED_STATUSES = Set.of("printed", "er_printed", "er_fail", "er_fatal");
+
+    /** {@code fiscal_status} of a receipt the printer refused; Fakturownia never retries it on its own. */
+    private static final String FISCAL_ERROR = "error";
+
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private final String departmentId;
@@ -92,6 +102,9 @@ final class FakturowniaReceiptMapper {
 
     private ObjectNode position(int index, ReceiptLine line) {
         requireSupportedKind(index, line.kind());
+        if (!line.unitGross().isPositive()) {
+            throw new ReceiptValidationException("line " + index + ": fiscal printers refuse a line worth 0 PLN; leave it out of the receipt");
+        }
         String name = lineName(line.name(), lineNameLength);
         if (name.isEmpty()) {
             throw new ReceiptValidationException("line " + index + ": name is empty after removing characters the fiscal module refuses");
@@ -180,9 +193,12 @@ final class FakturowniaReceiptMapper {
     // ---- response ------------------------------------------------------------------------------------
 
     /**
-     * Maps a receipt document to the contract: a non-empty {@code e_receipt_view_url} means FISCALISED; no link
-     * and {@code status == "rejected"} or {@code cancelled == true} means FAILED; anything else is PENDING.
-     * Fakturownia exposes neither the receipt number nor the cash register's unique number, so both stay null.
+     * Maps a receipt document to the contract. The printer's {@code fiscal_status} decides first: a fiscalised
+     * status (or an e-receipt link) means FISCALISED — the link may be missing when the printer printed on paper;
+     * {@code error} means FAILED with the printer's message. Without any fiscal status, {@code status == "rejected"}
+     * or {@code cancelled == true} means FAILED. Everything else — queued, printing, an unknown status, nothing
+     * yet — is PENDING. Fakturownia exposes neither the receipt number nor the cash register's unique number, so
+     * both stay null.
      */
     static Receipt toReceipt(JsonNode document, Clock clock) {
         String id = text(document, "id");
@@ -191,13 +207,24 @@ final class FakturowniaReceiptMapper {
         }
         String key = text(document, "oid");
         String url = text(document, "e_receipt_view_url");
-        if (url != null) {
+        String fiscalStatus = text(document, "fiscal_status");
+        if (url != null || (fiscalStatus != null && FISCALISED_STATUSES.contains(fiscalStatus))) {
             return Receipt.fiscalised(key, id, new FiscalData(null, null, fiscalisedAt(document, clock)), url);
         }
-        if ("rejected".equals(text(document, "status")) || document.path("cancelled").asBoolean(false)) {
+        if (FISCAL_ERROR.equals(fiscalStatus)) {
+            String printerError = text(document, "fiscal_print_error");
+            return Receipt.failed(key, id, new ReceiptFailure("fiscal_error",
+                    printerError == null ? "The fiscal printer refused the receipt" : printerError.strip()));
+        }
+        if (fiscalStatus == null && ("rejected".equals(text(document, "status")) || document.path("cancelled").asBoolean(false))) {
             return Receipt.failed(key, id, new ReceiptFailure("cancelled", "Receipt cancelled in Fakturownia"));
         }
         return Receipt.pending(key, id);
+    }
+
+    /** Whether Fakturownia holds any fiscalisation state for the document: queued, printing, done or failed. */
+    static boolean hasFiscalStatus(JsonNode document) {
+        return text(document, "fiscal_status") != null;
     }
 
     static boolean hasFiscalPrintMarker(JsonNode document) {
@@ -219,16 +246,17 @@ final class FakturowniaReceiptMapper {
         return "receipt".equals(text(document, "kind"));
     }
 
-    /** {@code print_time}, else {@code updated_at}, else now — the moment is approximate, the state is not. */
+    /**
+     * {@code updated_at}, else now. Fakturownia exposes no fiscalisation time: {@code print_time} is set by PDF
+     * printing and e-mailing on any document, so it is never used. The moment is approximate, the state is not.
+     */
     private static Instant fiscalisedAt(JsonNode document, Clock clock) {
-        for (String field : new String[]{"print_time", "updated_at"}) {
-            String value = text(document, field);
-            if (value != null) {
-                try {
-                    return OffsetDateTime.parse(value).toInstant();
-                } catch (DateTimeParseException ignored) {
-                    // try the next field
-                }
+        String value = text(document, "updated_at");
+        if (value != null) {
+            try {
+                return OffsetDateTime.parse(value).toInstant();
+            } catch (DateTimeParseException ignored) {
+                // fall back to now
             }
         }
         return clock.instant();

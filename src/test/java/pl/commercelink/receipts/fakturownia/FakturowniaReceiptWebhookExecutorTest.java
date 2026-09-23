@@ -35,7 +35,8 @@ class FakturowniaReceiptWebhookExecutorTest {
     private ObjectNode storedReceipt(String id) {
         ObjectNode document = JSON.createObjectNode().put("id", Long.parseLong(id)).put("kind", "receipt").put("oid", "order-9:R1")
                 .put("department_id", FakeFakturownia.DEPARTMENT_ID).put("status", "paid")
-                .put("e_receipt_view_url", "https://shop.paragony.pl/eR" + id).put("print_time", "2026-09-22T12:05:00.000+02:00");
+                .put("e_receipt_view_url", "https://shop.paragony.pl/eR" + id)
+                .put("fiscal_status", "er_printed").put("updated_at", "2026-09-22T12:05:00.000+02:00");
         fake.putInvoice(document);
         return document;
     }

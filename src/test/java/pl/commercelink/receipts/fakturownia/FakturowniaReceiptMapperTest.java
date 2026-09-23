@@ -291,6 +291,22 @@ class FakturowniaReceiptMapperTest {
         assertThrows(ReceiptValidationException.class, () -> mapper.toInvoice(request));
     }
 
+    @Test
+    void zeroValueLineIsRefused() {
+        // given
+        ReceiptRequest request = base()
+                .line(ReceiptLine.goods("Mysz", BigDecimal.ONE, Money.ofGrosze(9999), VatRate.VAT_23))
+                .line(ReceiptLine.shipping("Dostawa gratis", Money.ZERO, VatRate.VAT_23))
+                .payment(ReceiptPayment.of(PaymentForm.CARD, Money.ofGrosze(9999)))
+                .build();
+
+        // when
+        ReceiptValidationException refused = assertThrows(ReceiptValidationException.class, () -> mapper.toInvoice(request));
+
+        // then
+        assertTrue(refused.getMessage().contains("line 1"), refused.getMessage());
+    }
+
     // ---- document -> Receipt ---------------------------------------------------------------------------
 
     private static ObjectNode document() {
@@ -310,36 +326,82 @@ class FakturowniaReceiptMapperTest {
     }
 
     @Test
-    void documentWithEReceiptLinkIsFiscalisedAtPrintTime() {
+    void documentWithEReceiptLinkIsFiscalisedAtUpdatedAt() {
         // when
         Receipt receipt = FakturowniaReceiptMapper.toReceipt(document()
                 .put("e_receipt_view_url", "https://shop.paragony.pl/eRabc")
-                .put("print_time", "2026-09-22T12:05:00.000+02:00"), CLOCK);
+                .put("fiscal_status", "er_printed")
+                .put("print_time", "2026-09-01T08:00:00.000+02:00"), CLOCK);
 
         // then
         assertEquals(ReceiptState.FISCALISED, receipt.state());
         assertEquals("https://shop.paragony.pl/eRabc", receipt.documentUrl());
         assertNull(receipt.fiscal().receiptNumber());
         assertNull(receipt.fiscal().cashRegisterUniqueNumber());
-        assertEquals(Instant.parse("2026-09-22T10:05:00Z"), receipt.fiscal().fiscalisedAt());
+        assertEquals(Instant.parse("2026-09-22T10:00:30Z"), receipt.fiscal().fiscalisedAt(), "print_time is not the fiscalisation time");
     }
 
     @Test
-    void fiscalisationTimeFallsBackToUpdatedAtThenToNow() {
-        // when
-        Receipt fromUpdatedAt = FakturowniaReceiptMapper.toReceipt(document()
-                .put("e_receipt_view_url", "https://shop.paragony.pl/eRabc").put("print_time", "not a date"), CLOCK);
-        ObjectNode withoutTimes = document().put("e_receipt_view_url", "https://shop.paragony.pl/eRabc");
+    void fiscalisationTimeFallsBackToNowWithoutUpdatedAt() {
+        // given
+        ObjectNode withoutTimes = document().put("fiscal_status", "printed");
         withoutTimes.remove("updated_at");
-        Receipt fromNow = FakturowniaReceiptMapper.toReceipt(withoutTimes, CLOCK);
+
+        // when
+        Receipt receipt = FakturowniaReceiptMapper.toReceipt(withoutTimes, CLOCK);
 
         // then
-        assertEquals(Instant.parse("2026-09-22T10:00:30Z"), fromUpdatedAt.fiscal().fiscalisedAt());
-        assertEquals(CLOCK.instant(), fromNow.fiscal().fiscalisedAt());
+        assertEquals(CLOCK.instant(), receipt.fiscal().fiscalisedAt());
     }
 
     @Test
-    void rejectedOrCancelledDocumentWithoutLinkIsFailed() {
+    void everyFiscalisedStatusIsFiscalisedEvenWithoutLink() {
+        for (String status : new String[]{"printed", "er_printed", "er_fail", "er_fatal"}) {
+            // when
+            Receipt receipt = FakturowniaReceiptMapper.toReceipt(document().put("fiscal_status", status), CLOCK);
+
+            // then
+            assertEquals(ReceiptState.FISCALISED, receipt.state(), status);
+            assertNull(receipt.documentUrl(), status);
+        }
+    }
+
+    @Test
+    void queuedOrPrintingOrUnknownStatusIsPending() {
+        for (String status : new String[]{"to_print", "to_print_f", "to_print_q", "printing", "something_new"}) {
+            // when
+            Receipt receipt = FakturowniaReceiptMapper.toReceipt(document().put("fiscal_status", status), CLOCK);
+
+            // then
+            assertEquals(ReceiptState.PENDING, receipt.state(), status);
+        }
+    }
+
+    @Test
+    void fiscalErrorIsFailedWithThePrinterMessage() {
+        // when
+        Receipt receipt = FakturowniaReceiptMapper.toReceipt(document().put("fiscal_status", "error")
+                .put("fiscal_print_error", "\nNiepoprawna wartość brutto na dokumencie"), CLOCK);
+
+        // then
+        assertEquals(ReceiptState.FAILED, receipt.state());
+        assertEquals("fiscal_error", receipt.failure().code());
+        assertEquals("Niepoprawna wartość brutto na dokumencie", receipt.failure().message());
+    }
+
+    @Test
+    void fiscalErrorWithoutMessageStillCarriesOne() {
+        // when
+        Receipt receipt = FakturowniaReceiptMapper.toReceipt(document().put("fiscal_status", "error"), CLOCK);
+
+        // then
+        assertEquals(ReceiptState.FAILED, receipt.state());
+        assertEquals("fiscal_error", receipt.failure().code());
+        assertFalse(receipt.failure().message().isBlank());
+    }
+
+    @Test
+    void rejectedOrCancelledDocumentWithoutFiscalStatusIsFailed() {
         // when
         Receipt rejected = FakturowniaReceiptMapper.toReceipt(document().put("status", "rejected"), CLOCK);
         Receipt cancelled = FakturowniaReceiptMapper.toReceipt(document().put("cancelled", true), CLOCK);
@@ -348,6 +410,35 @@ class FakturowniaReceiptMapperTest {
         assertEquals(ReceiptState.FAILED, rejected.state());
         assertEquals("cancelled", rejected.failure().code());
         assertEquals(ReceiptState.FAILED, cancelled.state());
+    }
+
+    @Test
+    void rejectedDocumentWithFiscalisedStatusIsNeverFailed() {
+        for (String status : new String[]{"printed", "er_printed", "er_fail", "er_fatal"}) {
+            // when
+            Receipt receipt = FakturowniaReceiptMapper.toReceipt(document().put("status", "rejected").put("cancelled", true)
+                    .put("fiscal_status", status), CLOCK);
+
+            // then
+            assertEquals(ReceiptState.FISCALISED, receipt.state(), "a sale registered on paper must never be re-issued: " + status);
+        }
+    }
+
+    @Test
+    void rejectedDocumentStillQueuedIsPendingNotFailed() {
+        // when
+        Receipt receipt = FakturowniaReceiptMapper.toReceipt(document().put("status", "rejected").put("fiscal_status", "to_print"), CLOCK);
+
+        // then
+        assertEquals(ReceiptState.PENDING, receipt.state(), "the printer may still register a queued sale");
+    }
+
+    @Test
+    void fiscalStatusIsDetected() {
+        assertTrue(FakturowniaReceiptMapper.hasFiscalStatus(document().put("fiscal_status", "to_print")));
+        assertFalse(FakturowniaReceiptMapper.hasFiscalStatus(document().putNull("fiscal_status")));
+        assertFalse(FakturowniaReceiptMapper.hasFiscalStatus(document().put("fiscal_status", "")));
+        assertFalse(FakturowniaReceiptMapper.hasFiscalStatus(document()));
     }
 
     @Test
