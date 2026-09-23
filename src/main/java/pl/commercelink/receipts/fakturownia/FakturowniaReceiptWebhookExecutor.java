@@ -18,9 +18,10 @@ import java.time.Duration;
 /**
  * Handles Fakturownia's {@code invoice:update} webhook. Fakturownia signs nothing: the only proof of origin is
  * the {@code api_token} it echoes in the body, compared with the store's {@code webhookToken}. The body is
- * only a trigger — its shape for receipts is undocumented — so the receipt is re-read through the API and
- * mapped exactly like {@code fetch}. Documents that are not this store's receipts, and read failures, yield
- * {@link WebhookOutcome#empty()}: the consumer polls PENDING receipts anyway, and Fakturownia never retries.
+ * only a trigger — it carries no fiscal status — so the receipt is re-read through the API and mapped exactly
+ * like {@code fetch}. Documents that are not this store's receipts, and read failures, yield
+ * {@link WebhookOutcome#empty()}. Fakturownia retries a failed delivery up to 25 times and then deactivates the
+ * webhook, so the consumer must answer 2xx to every authentic webhook and keeps polling PENDING receipts.
  */
 final class FakturowniaReceiptWebhookExecutor implements WebhookExecutor<Receipt> {
 
