@@ -62,8 +62,7 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
             return current;
         }
         if (current.state() == ReceiptState.FAILED) {
-            throw new ReceiptRejectedException(current.failure().code(), "Receipt " + id + " for key " + key
-                    + " will not be fiscalised (" + current.failure().message() + "); issue with a new receipt key");
+            throw willNotBeFiscalised(key, id, current);
         }
         if (FakturowniaReceiptMapper.hasFiscalPrintMarker(document) || FakturowniaReceiptMapper.hasFiscalStatus(document)) {
             // Already ordered — by us, by the operator in Fakturownia or by the account's automatic fiscalisation.
@@ -89,8 +88,12 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
             // queued by someone else between the two reads
             return Receipt.pending(key, id);
         }
-        orderFiscalPrint(id);
-        return Receipt.pending(key, id);
+        return orderFiscalPrint(key, id);
+    }
+
+    private static ReceiptRejectedException willNotBeFiscalised(String key, String id, Receipt failed) {
+        return new ReceiptRejectedException(failed.failure().code(), "Receipt " + id + " for key " + key
+                + " will not be fiscalised (" + failed.failure().message() + "); issue with a new receipt key");
     }
 
     /**
@@ -158,8 +161,8 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
         if (matches.size() > 1) {
             String ids = matches.stream().map(document -> document.path("id").asText()).collect(Collectors.joining(", "));
             throw new ReceiptOutcomeUnknownException("Fakturownia holds " + matches.size() + " receipts under key " + key
-                    + " (ids " + ids + "); fiscalisation is not ordered — keep the fiscalised one and delete the others"
-                    + " in Fakturownia before retrying");
+                    + " (ids " + ids + "); fiscalisation is not ordered — keep the document that has a fiscal status or"
+                    + " the commercelink marker, delete only documents with neither, and escalate if several have one");
         }
         return matches.stream().findFirst();
     }
@@ -213,15 +216,17 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
     }
 
     /**
-     * Orders fiscalisation. When the order certainly did not run (not sent, 401/403/404/429), the marker is
-     * removed on a best-effort basis so a retry with the same key can order again. Only a 400/422 is a
-     * rejection (the consumer then issues a new receipt key). Every other answer — a redirect, any other 4xx,
-     * 5xx or no answer — may have been sent after the job was queued, so the marker stays and the outcome is
-     * unknown: the receipt stays PENDING for the operator rather than risking a second fiscalisation.
+     * Orders fiscalisation and returns the receipt as PENDING. When the order certainly did not run (not sent,
+     * 401/403/404/429), the marker is removed on a best-effort basis so a retry with the same key can order again.
+     * A 400/422 is checked against a fresh read first (see {@link #afterFiscalPrintRefusal}). Every other answer —
+     * a redirect, any other 4xx, 5xx or no answer — may have been sent after the job was queued, so the marker
+     * stays and the outcome is unknown: the receipt stays PENDING for the operator rather than risking a second
+     * fiscalisation.
      */
-    private void orderFiscalPrint(String id) {
+    private Receipt orderFiscalPrint(String key, String id) {
         try {
             api.orderFiscalPrint(id, config.printerId());
+            return Receipt.pending(key, id);
         } catch (FakturowniaApiException e) {
             boolean http = e.kind() == FakturowniaApiException.Kind.HTTP;
             boolean certainlyNotRun = e.kind() == FakturowniaApiException.Kind.NOT_SENT
@@ -231,11 +236,39 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
                 throw new ReceiptException("Ordering fiscalisation of receipt " + id + " did not run: " + e.getMessage(), e);
             }
             if (http && (e.status() == 400 || e.status() == 422)) {
-                throw new ReceiptRejectedException(e.providerCode(), "Fakturownia refused to fiscalise receipt " + id
-                        + ": " + e.providerMessage(), e);
+                return afterFiscalPrintRefusal(key, id, e);
             }
             throw new ReceiptOutcomeUnknownException("Ordering fiscalisation of receipt " + id + ": " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * A 400/422 from {@code fiscal_print} does not prove that nothing was fiscalised: Fakturownia also refuses to
+     * order a receipt that is already queued or fiscal (with an undocumented status), and the receipt may have
+     * been queued after our last read. A rejection would make the consumer issue the sale again under a new key,
+     * so the document is re-read first. With a fiscal status or an e-receipt link, the refusal is ignored and the
+     * document decides: FISCALISED or PENDING is returned, FAILED is rejected exactly as in {@link #issue}. With
+     * neither, the refusal is final. If the re-read fails, the outcome is unknown and the marker stays.
+     */
+    private Receipt afterFiscalPrintRefusal(String key, String id, FakturowniaApiException refusal) {
+        String refused = "Fakturownia refused to fiscalise receipt " + id + " (HTTP " + refusal.status() + ": "
+                + refusal.providerMessage() + ")";
+        JsonNode document;
+        try {
+            document = api.getReceipt(id);
+        } catch (FakturowniaApiException e) {
+            throw new ReceiptOutcomeUnknownException(refused + " and re-reading it failed: " + e.getMessage(), e);
+        }
+        if (!FakturowniaReceiptMapper.hasFiscalStatus(document)
+                && FakturowniaReceiptMapper.text(document, "e_receipt_view_url") == null) {
+            throw new ReceiptRejectedException(refusal.providerCode(), "Fakturownia refused to fiscalise receipt " + id
+                    + ": " + refusal.providerMessage(), refusal);
+        }
+        Receipt current = toReceipt(document, true);
+        if (current.state() == ReceiptState.FAILED) {
+            throw willNotBeFiscalised(key, id, current);
+        }
+        return current;
     }
 
     private void clearMarker(String id) {

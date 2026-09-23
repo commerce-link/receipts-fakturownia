@@ -233,7 +233,7 @@ class FakturowniaReceiptProviderTest {
 
         // then
         assertEquals(1, fake.fiscalPrintCalls(), "neither document may be ordered again");
-        assertTrue(unknown.getMessage().contains("1") && unknown.getMessage().contains("1000"), unknown.getMessage());
+        assertTrue(unknown.getMessage().contains("(ids 1000, 1)"), unknown.getMessage());
         assertThrows(ReceiptOutcomeUnknownException.class, () -> provider.find(key));
     }
 
@@ -379,6 +379,21 @@ class FakturowniaReceiptProviderTest {
 
         // then: the marker is set, so the receipt waits for the operator instead of being ordered
         assertEquals(ReceiptState.PENDING, retried.state());
+        assertEquals(0, fiscalPrintRequests());
+    }
+
+    @Test
+    void receiptQueuedWhileMarkingIsNotOrdered() {
+        // given: someone queues the receipt between the read before the marker and the confirming read
+        fake.queueOnMarker();
+        ReceiptRequest request = request(uniqueKey());
+
+        // when
+        Receipt receipt = provider.issue(request);
+
+        // then
+        assertEquals(ReceiptState.PENDING, receipt.state());
+        assertEquals(0, fake.fiscalPrintCalls());
         assertEquals(0, fiscalPrintRequests());
     }
 
@@ -619,6 +634,70 @@ class FakturowniaReceiptProviderTest {
 
         // when / then
         assertExactly(ReceiptRejectedException.class, assertThrows(ReceiptException.class, () -> provider.issue(request(uniqueKey()))));
+    }
+
+    @Test
+    void fiscalPrintRefusalOfAReceiptQueuedMeanwhileIsPending() {
+        // given: the receipt was queued after our last read, and Fakturownia refuses the second order
+        fake.settleBeforeNextFiscalPrint("to_print");
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(422, "{\"code\":\"error\",\"message\":\"Paragon jest już w kolejce\"}"));
+        ReceiptRequest request = request(uniqueKey());
+
+        // when
+        Receipt receipt = provider.issue(request);
+
+        // then: a refused re-order of a queued receipt is not a failure, so the consumer keeps the key
+        assertEquals(ReceiptState.PENDING, receipt.state());
+        assertEquals(0, fake.fiscalPrintCalls());
+        assertEquals(FakturowniaReceiptMapper.FISCAL_PRINT_MARKER, fake.invoice(receipt.providerReceiptId()).get("internal_note").asText());
+    }
+
+    @Test
+    void fiscalPrintRefusalOfAReceiptFiscalisedMeanwhileIsFiscalised() {
+        // given
+        fake.settleBeforeNextFiscalPrint("er_fatal");
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(422, "{\"code\":\"error\",\"message\":\"Paragon jest już zafiskalizowany\"}"));
+
+        // when
+        Receipt receipt = provider.issue(request(uniqueKey()));
+
+        // then
+        assertEquals(ReceiptState.FISCALISED, receipt.state());
+        assertEquals(0, fake.fiscalPrintCalls());
+    }
+
+    @Test
+    void fiscalPrintRefusalOfAReceiptThePrinterRefusedMeanwhileIsRejectedAsPrinterError() {
+        // given
+        fake.settleBeforeNextFiscalPrint("error");
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(422, "{\"code\":\"error\",\"message\":\"Paragon ma już status\"}"));
+
+        // when
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request(uniqueKey())));
+
+        // then: the printer's failure decides, exactly as for a FAILED receipt found before the order
+        ReceiptRejectedException rejected = assertExactly(ReceiptRejectedException.class, thrown);
+        assertEquals("fiscal_error", rejected.code());
+        assertTrue(rejected.getMessage().contains("will not be fiscalised"), rejected.getMessage());
+    }
+
+    @Test
+    void fiscalPrintRefusalFollowedByAFailedReReadIsOutcomeUnknownAndKeepsTheMarker() {
+        // given: the read before the marker and the confirming read pass, the re-read after the refusal fails
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(422, "{\"code\":\"error\",\"message\":\"Odmowa\"}"));
+        fake.failNext(Endpoint.GET, new Fault.Pass());
+        fake.failNext(Endpoint.GET, new Fault.Pass());
+        fake.failNext(Endpoint.GET, new Fault.Status(500, "{\"code\":\"error\",\"message\":\"boom\"}"));
+        String key = uniqueKey();
+
+        // when
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request(key)));
+
+        // then
+        assertExactly(ReceiptOutcomeUnknownException.class, thrown);
+        String id = provider.find(key).orElseThrow().providerReceiptId();
+        assertEquals(FakturowniaReceiptMapper.FISCAL_PRINT_MARKER, fake.invoice(id).get("internal_note").asText());
+        assertEquals(0, fake.fiscalPrintCalls());
     }
 
     @Test

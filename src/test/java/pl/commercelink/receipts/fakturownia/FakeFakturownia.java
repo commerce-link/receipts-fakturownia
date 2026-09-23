@@ -72,6 +72,8 @@ final class FakeFakturownia implements AutoCloseable {
     private boolean listOmitsInternalNote;
     private boolean ignoreInternalNoteUpdates;
     private boolean autoFiscalisation;
+    private boolean queueOnMarker;
+    private String statusBeforeFiscalPrint;
     private String lastFiscalPrintAccept;
 
     FakeFakturownia() {
@@ -118,6 +120,22 @@ final class FakeFakturownia implements AutoCloseable {
     /** The account option "Automatyczna fiskalizacja paragonów po utworzeniu przez API" is on: every new receipt is queued at once. */
     synchronized void autoFiscalisation() {
         autoFiscalisation = true;
+    }
+
+    /**
+     * Someone queues the receipt while the adapter marks it: a PUT that stores {@code internal_note} also sets
+     * {@code fiscal_status: "to_print"}, as if the operator clicked "fiscal print" between the adapter's reads.
+     */
+    synchronized void queueOnMarker() {
+        queueOnMarker = true;
+    }
+
+    /**
+     * The next {@code fiscal_print} request finds the receipt already at this fiscal status, as if it was queued
+     * or settled after the adapter's last read. The status is set before any fault on that request answers.
+     */
+    synchronized void settleBeforeNextFiscalPrint(String status) {
+        statusBeforeFiscalPrint = status;
     }
 
     /** The {@code Accept} header of the last {@code fiscal_print} request. */
@@ -203,6 +221,11 @@ final class FakeFakturownia implements AutoCloseable {
                 fault = endpoint == null ? null : takeFault(endpoint);
                 if (endpoint == Endpoint.FISCAL_PRINT) {
                     lastFiscalPrintAccept = exchange.getRequestHeaders().getFirst("Accept");
+                    String id = query(rawQuery).get("id");
+                    if (statusBeforeFiscalPrint != null && id != null && invoices.containsKey(id)) {
+                        invoices.get(id).put("fiscal_status", statusBeforeFiscalPrint);
+                        statusBeforeFiscalPrint = null;
+                    }
                 }
             }
             if (!("Bearer " + API_KEY).equals(exchange.getRequestHeaders().getFirst("Authorization"))) {
@@ -307,6 +330,9 @@ final class FakeFakturownia implements AutoCloseable {
             applied.remove("internal_note");
         }
         invoice.setAll(applied);
+        if (queueOnMarker && applied.hasNonNull("internal_note") && !applied.get("internal_note").asText().isEmpty()) {
+            invoice.put("fiscal_status", "to_print");
+        }
         invoice.put("updated_at", "2026-09-22T12:00:30.000+02:00");
         return new Answer(200, invoice.toString());
     }
