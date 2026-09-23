@@ -682,6 +682,20 @@ class FakturowniaReceiptProviderTest {
     }
 
     @Test
+    void fiscalPrintRefusalOfAReceiptWithALinkIsFiscalisedNotRejected() {
+        // given: the e-receipt link was published after our last read, but fiscal_status was not set
+        fake.settleLinkBeforeNextFiscalPrint("https://test.paragony.pl/eRlink");
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(422, "{\"code\":\"error\",\"message\":\"Paragon jest już zafiskalizowany\"}"));
+
+        // when
+        Receipt receipt = provider.issue(request(uniqueKey()));
+
+        // then
+        assertEquals(ReceiptState.FISCALISED, receipt.state());
+        assertEquals(0, fake.fiscalPrintCalls());
+    }
+
+    @Test
     void fiscalPrintRefusalFollowedByAFailedReReadIsOutcomeUnknownAndKeepsTheMarker() {
         // given: the read before the marker and the confirming read pass, the re-read after the refusal fails
         fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(422, "{\"code\":\"error\",\"message\":\"Odmowa\"}"));

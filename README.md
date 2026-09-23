@@ -27,8 +27,8 @@ If the printer or the module is off, the receipt stays pending, possibly for hou
    set by the operator or by the account's automatic fiscalisation) or our marker → `PENDING` without ordering;
 4. write the marker `commercelink:fiscal-print-ordered` into the private note (`internal_note`), then read the
    document again and continue only if the marker is there;
-5. read the document once more and stop with `PENDING` if it gained a `fiscal_status` meanwhile (someone queued it
-   between the reads);
+5. if that confirming read also shows a `fiscal_status` (someone queued the receipt meanwhile), stop with `PENDING`
+   without ordering;
 6. order fiscalisation (`GET /invoices/fiscal_print?id=…&mode=e-receipt[&fiskator_name=…]`, `Accept: */*`) → `PENDING`.
    A 400/422 answer is checked against a fresh read of the document before it is treated as a refusal (see
    [Failures](#failures)).
@@ -188,7 +188,9 @@ well — both are harmless because the executor only reads.
 - **`fiscal_print` refused** (400/422 while the document has neither a `fiscal_status` nor an e-receipt link,
   `ReceiptRejectedException`): a non-fiscal receipt with the marker stays in Fakturownia. After fixing the cause
   (e.g. assign the printer to the department), delete it only if it still has no `fiscal_status`; never order it by
-  hand, since the consumer issues the sale under a new key.
+  hand, since the consumer issues the sale under a new key. This applies only after `ReceiptRejectedException` for a
+  refused `fiscal_print`: the consumer never retries that key. When the adapter reports several receipts under one
+  key, follow the duplicate rule above instead and never delete a document that carries the marker.
 
 ## Known limits and open risks
 

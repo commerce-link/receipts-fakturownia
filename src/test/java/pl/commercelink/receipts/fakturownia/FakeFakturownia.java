@@ -74,6 +74,7 @@ final class FakeFakturownia implements AutoCloseable {
     private boolean autoFiscalisation;
     private boolean queueOnMarker;
     private String statusBeforeFiscalPrint;
+    private String linkBeforeNextFiscalPrint;
     private String lastFiscalPrintAccept;
 
     FakeFakturownia() {
@@ -136,6 +137,15 @@ final class FakeFakturownia implements AutoCloseable {
      */
     synchronized void settleBeforeNextFiscalPrint(String status) {
         statusBeforeFiscalPrint = status;
+    }
+
+    /**
+     * The next {@code fiscal_print} request finds the receipt already carrying an {@code e_receipt_view_url},
+     * with no {@code fiscal_status}, as if the link was published without the field being set. Applied before
+     * any fault on that request answers, like {@link #settleBeforeNextFiscalPrint(String)}.
+     */
+    synchronized void settleLinkBeforeNextFiscalPrint(String url) {
+        linkBeforeNextFiscalPrint = url;
     }
 
     /** The {@code Accept} header of the last {@code fiscal_print} request. */
@@ -225,6 +235,10 @@ final class FakeFakturownia implements AutoCloseable {
                     if (statusBeforeFiscalPrint != null && id != null && invoices.containsKey(id)) {
                         invoices.get(id).put("fiscal_status", statusBeforeFiscalPrint);
                         statusBeforeFiscalPrint = null;
+                    }
+                    if (linkBeforeNextFiscalPrint != null && id != null && invoices.containsKey(id)) {
+                        invoices.get(id).put("e_receipt_view_url", linkBeforeNextFiscalPrint);
+                        linkBeforeNextFiscalPrint = null;
                     }
                 }
             }
