@@ -1,17 +1,27 @@
 package pl.commercelink.receipts.fakturownia;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import pl.commercelink.receipts.api.Money;
+import pl.commercelink.receipts.api.PaymentForm;
 import pl.commercelink.receipts.api.Receipt;
+import pl.commercelink.receipts.api.ReceiptBuyer;
 import pl.commercelink.receipts.api.ReceiptException;
+import pl.commercelink.receipts.api.ReceiptLine;
 import pl.commercelink.receipts.api.ReceiptOutcomeUnknownException;
+import pl.commercelink.receipts.api.ReceiptPayment;
 import pl.commercelink.receipts.api.ReceiptRejectedException;
 import pl.commercelink.receipts.api.ReceiptRequest;
 import pl.commercelink.receipts.api.ReceiptState;
+import pl.commercelink.receipts.api.ReceiptValidationException;
+import pl.commercelink.receipts.api.VatRate;
 import pl.commercelink.receipts.fakturownia.FakeFakturownia.Endpoint;
 import pl.commercelink.receipts.fakturownia.FakeFakturownia.Fault;
 
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -106,18 +116,143 @@ class FakturowniaReceiptProviderTest {
     }
 
     @Test
-    void issueOfACancelledReceiptIsRejected() {
+    void operatorRejectionOfAQueuedReceiptStaysPending() {
         // given
         ReceiptRequest request = request(uniqueKey());
         Receipt pending = provider.issue(request);
         fake.settleCancelled(pending.providerReceiptId());
 
         // when
+        Receipt reissued = provider.issue(request);
+
+        // then
+        assertEquals(ReceiptState.PENDING, reissued.state(), "the printer may still register a queued sale");
+        assertEquals(1, fake.fiscalPrintCalls());
+    }
+
+    @Test
+    void accountAutoFiscalisationIsDetectedAndNothingIsOrdered() {
+        // given
+        fake.autoFiscalisation();
+        String key = uniqueKey();
+
+        // when
+        Receipt receipt = provider.issue(request(key));
+
+        // then
+        assertEquals(ReceiptState.PENDING, receipt.state());
+        assertEquals(0, fake.fiscalPrintCalls(), "the account already queued it: a second order fiscalises the sale twice");
+        assertNull(fake.invoice(receipt.providerReceiptId()).get("internal_note"), "nothing is written either");
+    }
+
+    @Test
+    void receiptQueuedByTheOperatorIsNotOrderedAgain() {
+        // given: fiscal_print certainly did not run, so the marker was removed ...
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(401, "{\"code\":\"error\",\"message\":\"Unauthorized\"}"));
+        ReceiptRequest request = request(uniqueKey());
+        assertThrows(ReceiptException.class, () -> provider.issue(request));
+        String id = fake.requestLog().stream().filter(line -> line.startsWith("GET /invoices/fiscal_print"))
+                .findFirst().orElseThrow().replaceAll(".*[?&]id=([^&]+).*", "$1");
+        // ... and before the retry the operator clicked "fiscal print" in Fakturownia
+        fake.settleFiscalStatus(id, "to_print");
+
+        // when
+        Receipt retried = provider.issue(request);
+
+        // then
+        assertEquals(ReceiptState.PENDING, retried.state());
+        assertEquals(0, fake.fiscalPrintCalls());
+    }
+
+    @Test
+    void paperFiscalisedReceiptIsFiscalisedWithoutLinkAndNeverOrderedAgain() {
+        // given
+        ReceiptRequest request = request(uniqueKey());
+        Receipt pending = provider.issue(request);
+        fake.settleFiscalStatus(pending.providerReceiptId(), "er_fatal");
+
+        // when
+        Receipt fetched = provider.fetch(pending.providerReceiptId());
+        Receipt reissued = provider.issue(request);
+
+        // then
+        assertEquals(ReceiptState.FISCALISED, fetched.state());
+        assertNull(fetched.documentUrl());
+        assertEquals(ReceiptState.FISCALISED, reissued.state());
+        assertEquals(1, fake.fiscalPrintCalls());
+    }
+
+    @Test
+    void printerErrorFailsTheAttemptWithThePrinterMessage() {
+        // given
+        ReceiptRequest request = request(uniqueKey());
+        Receipt pending = provider.issue(request);
+        fake.settleFiscalError(pending.providerReceiptId(), "Niepoprawna wartość brutto na dokumencie");
+
+        // when
+        Receipt fetched = provider.fetch(pending.providerReceiptId());
         ReceiptRejectedException rejected = assertThrows(ReceiptRejectedException.class, () -> provider.issue(request));
 
         // then
-        assertEquals("cancelled", rejected.code());
+        assertEquals(ReceiptState.FAILED, fetched.state());
+        assertEquals("fiscal_error", fetched.failure().code());
+        assertEquals("fiscal_error", rejected.code());
+        assertTrue(rejected.getMessage().contains("Niepoprawna wartość brutto"), rejected.getMessage());
         assertEquals(1, fake.fiscalPrintCalls());
+    }
+
+    @Test
+    void operatorRejectionOfAPaperFiscalisedReceiptIsNeverFailed() {
+        // given
+        ReceiptRequest request = request(uniqueKey());
+        Receipt pending = provider.issue(request);
+        fake.settleFiscalStatus(pending.providerReceiptId(), "printed");
+        fake.settleCancelled(pending.providerReceiptId());
+
+        // when
+        Receipt reissued = provider.issue(request);
+
+        // then
+        assertEquals(ReceiptState.FISCALISED, reissued.state(), "FAILED would make the app issue the sale again");
+        assertEquals(1, fake.fiscalPrintCalls());
+    }
+
+    @Test
+    void duplicateReceiptsUnderOneKeyAreOutcomeUnknownAndNothingIsOrdered() {
+        // given: the receipt exists and was ordered; an earlier, lost create surfaces later under the same oid
+        String key = uniqueKey();
+        provider.issue(request(key));
+        ObjectNode older = new ObjectMapper().createObjectNode().put("id", 1).put("kind", "receipt").put("oid", key)
+                .put("department_id", FakeFakturownia.DEPARTMENT_ID);
+        older.putNull("e_receipt_view_url");
+        older.putNull("fiscal_status");
+        fake.putInvoice(older);
+
+        // when
+        ReceiptOutcomeUnknownException unknown = assertThrows(ReceiptOutcomeUnknownException.class, () -> provider.issue(request(key)));
+
+        // then
+        assertEquals(1, fake.fiscalPrintCalls(), "neither document may be ordered again");
+        assertTrue(unknown.getMessage().contains("1") && unknown.getMessage().contains("1000"), unknown.getMessage());
+        assertThrows(ReceiptOutcomeUnknownException.class, () -> provider.find(key));
+    }
+
+    @Test
+    void zeroValueLineIsRefusedBeforeAnyRemoteCall() {
+        // given
+        ReceiptRequest request = ReceiptRequest.builder()
+                .receiptKey(uniqueKey())
+                .orderId("order-zero")
+                .saleDate(LocalDateTime.of(2026, 9, 22, 12, 0))
+                .line(ReceiptLine.goods("Kabel", BigDecimal.ONE, Money.ofGrosze(1000), VatRate.VAT_23))
+                .line(ReceiptLine.shipping("Dostawa gratis", Money.ZERO, VatRate.VAT_23))
+                .payment(ReceiptPayment.of(PaymentForm.CARD, Money.ofGrosze(1000)))
+                .buyer(ReceiptBuyer.builder().email("jan@example.com").build())
+                .build();
+
+        // when / then
+        assertThrows(ReceiptValidationException.class, () -> provider.issue(request));
+        assertEquals(0, fake.requests());
     }
 
     // ---- lost responses: fiscalisation at most once ---------------------------------------------------

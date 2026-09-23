@@ -13,17 +13,18 @@ import pl.commercelink.receipts.api.ReceiptState;
 import pl.commercelink.receipts.api.ReceiptValidationException;
 
 import java.time.Clock;
-import java.util.Comparator;
+import java.util.List;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * Issues e-receipts through Fakturownia (paragony.pl). {@link #issue} is a state machine resumed by receipt key:
  * look the receipt up by {@code oid}, create it when absent, re-read the full document by id, then — unless it
- * already carries the fiscal-print marker — write the marker, confirm it with another read and order
- * fiscalisation. The marker is written and confirmed before the order, so a
- * retry after any failure never orders fiscalisation twice (at most once; a lost order leaves the receipt
- * PENDING for the operator). Stateless and thread-safe; callers must not issue the same key concurrently
- * (the consumer serialises issuing per store).
+ * already has a fiscal status or carries the fiscal-print marker — write the marker, confirm it with another read
+ * and order fiscalisation. The marker is written and confirmed before the order, so a retry after any failure
+ * never orders fiscalisation twice (at most once; a lost order leaves the receipt PENDING for the operator).
+ * Several receipts under one key are never ordered. Stateless and thread-safe; callers must not issue the same key
+ * concurrently — including a queue redelivering a message while the first {@code issue} still runs.
  */
 public final class FakturowniaReceiptProvider implements ReceiptProvider {
 
@@ -61,10 +62,12 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
             return current;
         }
         if (current.state() == ReceiptState.FAILED) {
-            throw new ReceiptRejectedException("cancelled", "Receipt " + id + " for key " + key
-                    + " was cancelled in Fakturownia; issue with a new receipt key");
+            throw new ReceiptRejectedException(current.failure().code(), "Receipt " + id + " for key " + key
+                    + " will not be fiscalised (" + current.failure().message() + "); issue with a new receipt key");
         }
-        if (FakturowniaReceiptMapper.hasFiscalPrintMarker(document)) {
+        if (FakturowniaReceiptMapper.hasFiscalPrintMarker(document) || FakturowniaReceiptMapper.hasFiscalStatus(document)) {
+            // Already ordered — by us, by the operator in Fakturownia or by the account's automatic fiscalisation.
+            // Fakturownia does not refuse a second order for a queued receipt, so ordering again fiscalises twice.
             return current;
         }
         try {
@@ -82,10 +85,19 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
             throw new ReceiptException("The fiscal-print marker of receipt " + id
                     + " could not be confirmed; fiscalisation was not ordered");
         }
+        if (FakturowniaReceiptMapper.hasFiscalStatus(marked)) {
+            // queued by someone else between the two reads
+            return Receipt.pending(key, id);
+        }
         orderFiscalPrint(id);
         return Receipt.pending(key, id);
     }
 
+    /**
+     * Read-only lookup by exact {@code oid}. Throws {@link ReceiptOutcomeUnknownException} when several receipts
+     * share the key (see {@link #lookup}); a PENDING result does not tell whether fiscalisation was ordered, so
+     * after an unknown outcome the consumer retries {@link #issue} with the same key.
+     */
     @Override
     public Optional<Receipt> find(String receiptKey) {
         ReceiptKeys.requireValid(receiptKey);
@@ -127,17 +139,29 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
         return true;
     }
 
-    /** The receipt stored under this exact {@code oid} in the configured department; the lowest id wins. */
+    /**
+     * The receipt stored under this exact {@code oid} in the configured department. More than one is an anomaly
+     * (a lost create that surfaced late, or {@code oid_unique} not enforced): which one to fiscalise is the
+     * operator's call, so it is {@link ReceiptOutcomeUnknownException} and nothing is ordered.
+     */
     private Optional<JsonNode> lookup(String key) {
+        List<JsonNode> matches;
         try {
-            return api.findReceiptsByOid(key, config.departmentId()).stream()
+            matches = api.findReceiptsByOid(key, config.departmentId()).stream()
                     .filter(document -> key.equals(FakturowniaReceiptMapper.text(document, "oid")))
                     .filter(FakturowniaReceiptMapper::isReceipt)
                     .filter(this::inConfiguredDepartment)
-                    .min(Comparator.comparingLong(document -> document.path("id").asLong(Long.MAX_VALUE)));
+                    .toList();
         } catch (FakturowniaApiException e) {
             throw new ReceiptException("Looking up receipt " + key + " failed: " + e.getMessage(), e);
         }
+        if (matches.size() > 1) {
+            String ids = matches.stream().map(document -> document.path("id").asText()).collect(Collectors.joining(", "));
+            throw new ReceiptOutcomeUnknownException("Fakturownia holds " + matches.size() + " receipts under key " + key
+                    + " (ids " + ids + "); fiscalisation is not ordered — keep the fiscalised one and delete the others"
+                    + " in Fakturownia before retrying");
+        }
+        return matches.stream().findFirst();
     }
 
     /** The list call already filters by department; a document that states another department is still skipped. */

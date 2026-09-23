@@ -71,6 +71,7 @@ final class FakeFakturownia implements AutoCloseable {
     private int requests;
     private boolean listOmitsInternalNote;
     private boolean ignoreInternalNoteUpdates;
+    private boolean autoFiscalisation;
     private String lastFiscalPrintAccept;
 
     FakeFakturownia() {
@@ -112,6 +113,11 @@ final class FakeFakturownia implements AutoCloseable {
     /** A PUT answers 200 but does not persist {@code internal_note} (whether receipts accept it is undocumented). */
     synchronized void ignoreInternalNoteUpdates() {
         ignoreInternalNoteUpdates = true;
+    }
+
+    /** The account option "Automatyczna fiskalizacja paragonów po utworzeniu przez API" is on: every new receipt is queued at once. */
+    synchronized void autoFiscalisation() {
+        autoFiscalisation = true;
     }
 
     /** The {@code Accept} header of the last {@code fiscal_print} request. */
@@ -253,7 +259,11 @@ final class FakeFakturownia implements AutoCloseable {
         invoice.put("updated_at", "2026-09-22T12:00:00.000+02:00");
         invoice.putNull("e_receipt_view_url");
         invoice.putNull("print_time");
-        invoice.putNull("fiscal_status");
+        if (autoFiscalisation && "receipt".equals(invoice.path("kind").asText())) {
+            invoice.put("fiscal_status", "to_print");
+        } else {
+            invoice.putNull("fiscal_status");
+        }
         invoice.put("cancelled", false);
         invoice.remove("oid_unique");
         invoices.put(String.valueOf(id), invoice);
@@ -307,6 +317,7 @@ final class FakeFakturownia implements AutoCloseable {
         }
         fiscalPrintCalls++;
         fiscalPrintsById.merge(id, 1, Integer::sum);
+        invoices.get(id).put("fiscal_status", "to_print");
         return new Answer(200, "OK");
     }
 
