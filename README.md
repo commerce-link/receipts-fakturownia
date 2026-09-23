@@ -18,15 +18,20 @@ If the printer or the module is off, the receipt stays pending, possibly for hou
 
 `issue` is a state machine resumed by receipt key (the key is stored as the document's `oid`):
 
-1. look the receipt up (`GET /invoices.json?oid=…&kind=receipt&period=all&department_id=…`, exact match on our side);
+1. look the receipt up (`GET /invoices.json?oid=…&kind=receipt&period=all&department_id=…&per_page=100`, exact
+   match on our side);
 2. create it when absent (`POST /invoices.json` with `oid_unique: "yes"`);
-3. if it already has an e-receipt link → `FISCALISED`; if it carries our fiscal-print marker → `PENDING`;
-4. write the marker `commercelink:fiscal-print-ordered` into the private note (`internal_note`);
-5. order fiscalisation (`GET /invoices/fiscal_print?id=…&mode=e-receipt[&fiskator_name=…]`) → `PENDING`.
+3. re-read the full document by id (`GET /invoices/{id}.json`) and decide on it, never on the list or create answer:
+   an e-receipt link → `FISCALISED`; cancelled/rejected → `ReceiptRejectedException` (`cancelled`, issue with a new
+   key); our fiscal-print marker → `PENDING` without ordering again;
+4. write the marker `commercelink:fiscal-print-ordered` into the private note (`internal_note`), then read the
+   document again and continue only if the marker is there;
+5. order fiscalisation (`GET /invoices/fiscal_print?id=…&mode=e-receipt[&fiskator_name=…]`, `Accept: */*`) → `PENDING`.
 
 **Fiscalisation is ordered at most once.** A sale registered twice in fiscal memory cannot be undone, while a missing
 fiscalisation is fixed by one click in Fakturownia. So the marker is written *before* the order, and a retry that sees
-the marker never orders again. If an order is lost after the marker, the receipt stays `PENDING` and the consumer's
+the marker never orders again. The marker must be confirmed by a fresh read before the order: if Fakturownia does not
+persist it, `issue` stops with `ReceiptException` and orders nothing. If an order is lost after the marker, the receipt stays `PENDING` and the consumer's
 "pending too long" alert sends the operator to Fakturownia. `fiscal_print` is sent through a one-shot HTTP/1.1
 connection (`OneShotHttpGet`), because both JDK HTTP clients silently resend a GET when the server closes the
 connection before answering.
@@ -48,9 +53,17 @@ does not expose them. `fiscalisedAt` is `print_time`, or `updated_at` when that 
 | Situation | Exception |
 |---|---|
 | invalid request, missing buyer e-mail, mixed payment forms, a name with only refused characters | `ReceiptValidationException` |
-| Fakturownia unreachable, HTTP 401/403/404/429 | `ReceiptException` (nothing happened; retry with the same key) |
-| HTTP 400/422 on create, 4xx on `fiscal_print`, a receipt cancelled in Fakturownia | `ReceiptRejectedException` (issue with a new key) |
-| timeout or dropped connection after sending, 5xx, a receipt that appeared during create | `ReceiptOutcomeUnknownException` (`find`, then retry with the same key) |
+| Fakturownia unreachable, HTTP 401/403/404/429, a failed read of the document, a marker that could not be confirmed | `ReceiptException` (no fiscalisation was ordered in this call; retry with the same key) |
+| HTTP 400/422 on create (unless the error names `oid`), 400/422 on `fiscal_print`, a receipt cancelled in Fakturownia | `ReceiptRejectedException` (issue with a new key) |
+| timeout or dropped connection after sending; 5xx; any other answer to `fiscal_print` (3xx, other 4xx); a receipt that appeared during create; a create error naming `oid` (the receipt exists but the lookup cannot find it) | `ReceiptOutcomeUnknownException` (`find`, then retry with the same key) |
+
+`Rejected` makes the consumer issue a new receipt, which is fiscalised again, so it only follows an answer that proves
+nothing ran. `fiscal_print` is an undocumented UI-style route: a redirect or a `406` may arrive after the job was
+queued, so those leave the marker in place and the receipt waits as `PENDING` for the operator. A receipt that exists
+but cannot be found by `oid` stays `OutcomeUnknown` until the lookup finds it or the operator acts.
+
+When the confirming read after the marker fails, the marker is most likely set: every retry then returns `PENDING`
+without ordering, and the receipt needs the operator, exactly like a lost `fiscal_print` answer.
 
 ## Account requirements
 
@@ -66,11 +79,11 @@ does not expose them. `fiscalisedAt` is `print_time`, or `updated_at` when that 
 
 | Field | Required | Meaning |
 |---|---|---|
-| `apiUrl` | yes | `https://{prefix}.fakturownia.pl` |
-| `apiKey` | yes | API token (*Ustawienia › Ustawienia konta › Integracja › Kod autoryzacyjny API*), sent as `Authorization: Bearer` |
+| `apiUrl` | yes | `https://{prefix}.fakturownia.pl`; must be `https` (plain `http` only for `localhost`/`127.0.0.1`/`::1`) and carry no path, query or fragment |
+| `apiKey` | yes | API token (*Ustawienia › Ustawienia konta › Integracja › Kod autoryzacyjny API*), sent as `Authorization: Bearer`; visible ASCII only |
 | `departmentId` | yes | department (company) the receipts are issued for |
 | `printerId` | no | printer id from `https://{prefix}.fakturownia.pl/printers.json`, sent as `fiskator_name`; empty = default printer |
-| `webhookToken` | yes | the "API token" entered in the Fakturownia webhook (see below) |
+| `webhookToken` | yes | the "API token" entered in the Fakturownia webhook (see below); surrounding whitespace is ignored |
 | `lineNameLength` | no | longest line name, 1–40 (default 40; use 38 when the account adds the VAT letter to product names) |
 
 ## Status webhook
@@ -86,7 +99,7 @@ used only as a trigger. The adapter re-reads the document through the API and ma
 forged body cannot change a receipt's state. The executor ignores (with `WebhookOutcome.empty()`):
 
 - events about other document kinds;
-- receipts of other departments;
+- receipts that state another department (a document without `department_id` is accepted, the same rule as `find`);
 - receipts without a receipt-key `oid`, i.e. issued by hand or by another integration;
 - read failures.
 
@@ -108,11 +121,15 @@ Fakturownia does not retry webhooks, so the consumer keeps polling `PENDING` rec
 
 - **Printer rejected the sale** (e.g. wrong VAT rate letter, the VAT "step" rule for a product name sold earlier at a
   lower rate): mark the receipt as rejected/cancelled in Fakturownia. The next poll or webhook reports `FAILED` and
-  the consumer can issue a new attempt. Put the distinguishing part at the start of shipping line names: printers
+  the consumer can issue a new attempt. **Only mark a receipt rejected/cancelled when the printer did NOT register the
+  sale** — check the printer's fiscal report first. `FAILED` means "certainly not fiscalised": the next attempt
+  fiscalises the sale again, so cancelling a receipt the printer did register (including one fiscalised on paper
+  without an e-receipt link) records the sale twice in fiscal memory. Put the distinguishing part at the start of shipping line names: printers
   refuse a name previously sold at a lower VAT rate.
 - **Receipt pending for long**: check the printer and the Paragony.pl module. If the receipt carries the marker but was
-  never fiscalised, order the fiscal print by hand in Fakturownia.
-- **`fiscal_print` refused** (`ReceiptRejectedException`): a non-fiscal receipt with the marker stays in Fakturownia.
+  never fiscalised, order the fiscal print by hand in Fakturownia. This also covers `fiscal_print` answers the adapter
+  could not interpret (`ReceiptOutcomeUnknownException`, marker kept).
+- **`fiscal_print` refused** (400/422, `ReceiptRejectedException`): a non-fiscal receipt with the marker stays in Fakturownia.
   Delete it after fixing the cause (e.g. assign the printer to the department).
 
 ## Known limits and open risks
@@ -125,7 +142,11 @@ Verified only against a fake backend built from the documentation (no test accou
   adapter filters exactly itself);
 - the `calculating_strategy` value that matches "zgodnie z kasą fiskalną", and how `payment_type` is printed;
 - `Authorization: Bearer` on every endpoint used (documented in the e-receipt guide; `api_token` is the fallback);
-- `status: "rejected"` / `cancelled` as the operator's way to mark a dead attempt.
+- `status: "rejected"` / `cancelled` as the operator's way to mark a dead attempt;
+- whether `internal_note` can be written on a `kind: receipt` document (if not, `issue` never orders fiscalisation and
+  says the marker could not be confirmed — visible on the first live receipt), and which fields the list endpoint
+  returns (the adapter decides on `GET /invoices/{id}.json` for that reason);
+- the status codes of `fiscal_print` (only 400/422 are treated as a refusal).
 
 ## Build
 
