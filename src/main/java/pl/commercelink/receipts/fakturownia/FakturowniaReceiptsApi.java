@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
-import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
 import java.net.ConnectException;
 import java.net.URI;
@@ -39,17 +38,11 @@ class FakturowniaReceiptsApi {
     private final String baseUrl;
     private final String apiKey;
     private final Duration timeout;
-    private final SSLSocketFactory tls;
 
     FakturowniaReceiptsApi(String baseUrl, String apiKey, Duration timeout) {
-        this(baseUrl, apiKey, timeout, (SSLSocketFactory) SSLSocketFactory.getDefault());
-    }
-
-    FakturowniaReceiptsApi(String baseUrl, String apiKey, Duration timeout, SSLSocketFactory tls) {
         this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
         this.apiKey = apiKey;
         this.timeout = timeout;
-        this.tls = tls;
     }
 
     /** {@code POST /invoices.json}; returns the created document. */
@@ -103,7 +96,7 @@ class FakturowniaReceiptsApi {
         if (printerId != null && !printerId.isBlank()) {
             query += "&fiskator_name=" + encode(printerId);
         }
-        OneShotHttpGet.Response response = new OneShotHttpGet(tls, CONNECT_TIMEOUT, timeout)
+        OneShotHttpGet.Response response = new OneShotHttpGet((javax.net.ssl.SSLSocketFactory) javax.net.ssl.SSLSocketFactory.getDefault(), CONNECT_TIMEOUT, timeout)
                 .get(URI.create(baseUrl + "/invoices/fiscal_print" + query),
                         Map.of("Accept", "application/json", "Authorization", "Bearer " + apiKey));
         if (response.status() / 100 != 2) {
