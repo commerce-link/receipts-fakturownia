@@ -514,6 +514,19 @@ class FakturowniaReceiptProviderTest {
     }
 
     @Test
+    void createErrorKeyedOidUniqueIsOutcomeUnknownEvenWhenTheLookupMisses() {
+        // given: Fakturownia keys the duplicate-oid error "oid_unique" (the real format is undocumented) and the lookup misses it
+        fake.failNext(Endpoint.CREATE, new Fault.Status(422, "{\"code\":\"error\",\"message\":{\"oid_unique\":[\"jest już zajęte\"]}}"));
+
+        // when
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request(uniqueKey())));
+
+        // then
+        assertExactly(ReceiptOutcomeUnknownException.class, thrown);
+        assertEquals(0, fake.fiscalPrintCalls());
+    }
+
+    @Test
     void fiscalPrintServerErrorIsOutcomeUnknown() {
         // given
         fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(502, "Bad gateway"));

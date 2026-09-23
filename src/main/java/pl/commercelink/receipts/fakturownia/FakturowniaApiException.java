@@ -92,16 +92,28 @@ final class FakturowniaApiException extends RuntimeException {
     }
 
     /**
-     * Whether the error body names this field: a key of the object-shaped {@code message}
-     * ({@code {"message":{"oid":[…]}}}), or the field as a whole word in a plain-text {@code message} or body.
+     * Whether the error body names this field, or a variant Fakturownia keys as {@code field_<suffix>}
+     * (e.g. {@code oid_unique} — the real key format is undocumented): a key of the object-shaped
+     * {@code message} equal to {@code field} or starting with {@code field + "_"}
+     * ({@code {"message":{"oid_unique":[…]}}}), or {@code field} as a standalone token (not preceded or
+     * followed by a letter or digit, so {@code oid_unique} and {@code oid:} match but {@code void} and
+     * {@code oidx} do not) in a plain-text {@code message} or the raw body.
      */
     boolean mentionsField(String field) {
         JsonNode message = parsedBody().path("message");
         if (message.isObject()) {
-            return message.has(field);
+            Iterator<String> keys = message.fieldNames();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                if (key.equals(field) || key.startsWith(field + "_")) {
+                    return true;
+                }
+            }
+            return false;
         }
         String text = message.isTextual() ? message.asText() : body;
-        return text != null && Pattern.compile("\\b" + Pattern.quote(field) + "\\b", Pattern.CASE_INSENSITIVE).matcher(text).find();
+        return text != null && Pattern.compile("(?<![A-Za-z0-9])" + Pattern.quote(field) + "(?![A-Za-z0-9])", Pattern.CASE_INSENSITIVE)
+                .matcher(text).find();
     }
 
     private JsonNode parsedBody() {
