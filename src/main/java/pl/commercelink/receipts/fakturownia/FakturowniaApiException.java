@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 /**
  * A failed call to the Fakturownia API, classified by how far it got. The provider turns the kind into the
@@ -88,6 +89,19 @@ final class FakturowniaApiException extends RuntimeException {
             return String.join("; ", parts);
         }
         return body == null || body.isBlank() ? "HTTP " + status : body;
+    }
+
+    /**
+     * Whether the error body names this field: a key of the object-shaped {@code message}
+     * ({@code {"message":{"oid":[…]}}}), or the field as a whole word in a plain-text {@code message} or body.
+     */
+    boolean mentionsField(String field) {
+        JsonNode message = parsedBody().path("message");
+        if (message.isObject()) {
+            return message.has(field);
+        }
+        String text = message.isTextual() ? message.asText() : body;
+        return text != null && Pattern.compile("\\b" + Pattern.quote(field) + "\\b", Pattern.CASE_INSENSITIVE).matcher(text).find();
     }
 
     private JsonNode parsedBody() {

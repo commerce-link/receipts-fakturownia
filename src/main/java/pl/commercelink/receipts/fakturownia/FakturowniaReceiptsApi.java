@@ -19,6 +19,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+import javax.net.ssl.SSLSocketFactory;
+
 /**
  * Thin transport over the Fakturownia REST API (https://github.com/fakturownia/API,
  * https://github.com/e-paragony/api). Never retries: every failure is thrown as a
@@ -85,7 +87,8 @@ class FakturowniaReceiptsApi {
 
     /**
      * {@code GET /invoices/fiscal_print?id=…&mode=e-receipt[&fiskator_name=…]}: orders fiscalisation on the
-     * printer. The response body is undocumented and ignored; a 2xx only means the job was queued.
+     * printer. The response body is undocumented and ignored; a 2xx only means the job was queued. Any other
+     * status (redirects are never followed) is thrown as {@link FakturowniaApiException.Kind#HTTP}.
      *
      * <p>Sent through {@link OneShotHttpGet}, never through {@link HttpClient}: the JDK client silently resends
      * a GET when the server closes the connection before answering, and Fakturownia documents this
@@ -96,9 +99,11 @@ class FakturowniaReceiptsApi {
         if (printerId != null && !printerId.isBlank()) {
             query += "&fiskator_name=" + encode(printerId);
         }
-        OneShotHttpGet.Response response = new OneShotHttpGet((javax.net.ssl.SSLSocketFactory) javax.net.ssl.SSLSocketFactory.getDefault(), CONNECT_TIMEOUT, timeout)
+        // Accept: */* — the body is ignored, and a Rails action that renders only HTML answers 406 to an
+        // Accept: application/json request after it has already queued the job.
+        OneShotHttpGet.Response response = new OneShotHttpGet((SSLSocketFactory) SSLSocketFactory.getDefault(), CONNECT_TIMEOUT, timeout)
                 .get(URI.create(baseUrl + "/invoices/fiscal_print" + query),
-                        Map.of("Accept", "application/json", "Authorization", "Bearer " + apiKey));
+                        Map.of("Accept", "*/*", "Authorization", "Bearer " + apiKey));
         if (response.status() / 100 != 2) {
             throw FakturowniaApiException.http(response.status(), response.body());
         }

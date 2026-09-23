@@ -198,6 +198,111 @@ class FakturowniaReceiptProviderTest {
         assertEquals(1, fake.fiscalPrintCalls());
     }
 
+    @Test
+    void lostFiscalPrintResponseIsNotOrderedAgainWhenTheListOmitsTheMarker() {
+        // given: the list endpoint does not return internal_note, so only the full document shows the marker
+        fake.listOmitsInternalNote();
+        ReceiptRequest request = request(uniqueKey());
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.DropAfterApplying());
+        assertExactly(ReceiptOutcomeUnknownException.class, assertThrows(ReceiptException.class, () -> provider.issue(request)));
+
+        // when
+        Receipt retried = provider.issue(request);
+
+        // then
+        assertEquals(ReceiptState.PENDING, retried.state());
+        assertEquals(1, fake.fiscalPrintCalls());
+    }
+
+    @Test
+    void markerThatTheServerDoesNotPersistIsReceiptExceptionAndNothingIsOrdered() {
+        // given: the PUT answers 200 but internal_note is not stored
+        fake.ignoreInternalNoteUpdates();
+        ReceiptRequest request = request(uniqueKey());
+
+        // when
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request));
+        assertThrows(ReceiptException.class, () -> provider.issue(request));
+
+        // then
+        assertExactly(ReceiptException.class, thrown);
+        assertTrue(thrown.getMessage().contains("could not be confirmed"), thrown.getMessage());
+        assertEquals(0, fiscalPrintRequests());
+        assertEquals(1, fake.createCalls());
+    }
+
+    @Test
+    void failedMarkerConfirmationIsReceiptExceptionAndTheRetryDoesNotOrder() {
+        // given: the read before the marker passes, the confirming read after it fails
+        ReceiptRequest request = request(uniqueKey());
+        fake.failNext(Endpoint.GET, new Fault.Pass());
+        fake.failNext(Endpoint.GET, new Fault.Status(503, "busy"));
+        assertExactly(ReceiptException.class, assertThrows(ReceiptException.class, () -> provider.issue(request)));
+
+        // when
+        Receipt retried = provider.issue(request);
+
+        // then: the marker is set, so the receipt waits for the operator instead of being ordered
+        assertEquals(ReceiptState.PENDING, retried.state());
+        assertEquals(0, fiscalPrintRequests());
+    }
+
+    @Test
+    void failedReadBeforeTheMarkerIsReceiptExceptionAndTheRetryResumes() {
+        // given
+        ReceiptRequest request = request(uniqueKey());
+        fake.failNext(Endpoint.GET, new Fault.Status(503, "busy"));
+        assertExactly(ReceiptException.class, assertThrows(ReceiptException.class, () -> provider.issue(request)));
+        assertEquals(0, fiscalPrintRequests());
+
+        // when
+        Receipt retried = provider.issue(request);
+
+        // then
+        assertEquals(ReceiptState.PENDING, retried.state());
+        assertEquals(1, fake.createCalls());
+        assertEquals(1, fake.fiscalPrintCalls());
+    }
+
+    @Test
+    void fiscalPrintRedirectIsOutcomeUnknownAndTheRetryDoesNotOrderAgain() {
+        assertAmbiguousFiscalPrintAnswerKeepsTheMarker(302, "<html><body>You are being redirected.</body></html>");
+    }
+
+    @Test
+    void fiscalPrintNotAcceptableIsOutcomeUnknownAndTheRetryDoesNotOrderAgain() {
+        assertAmbiguousFiscalPrintAnswerKeepsTheMarker(406, "Not Acceptable");
+    }
+
+    private void assertAmbiguousFiscalPrintAnswerKeepsTheMarker(int status, String body) {
+        // given
+        ReceiptRequest request = request(uniqueKey());
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(status, body));
+
+        // when
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request));
+        Receipt retried = provider.issue(request);
+
+        // then
+        assertExactly(ReceiptOutcomeUnknownException.class, thrown);
+        assertEquals(FakturowniaReceiptMapper.FISCAL_PRINT_MARKER, fake.invoice(retried.providerReceiptId()).get("internal_note").asText());
+        assertEquals(ReceiptState.PENDING, retried.state());
+        assertEquals(1, fiscalPrintRequests(), "an ambiguous answer must never lead to a second fiscal order");
+    }
+
+    @Test
+    void fiscalPrintIsSentWithAcceptAnything() {
+        // when
+        provider.issue(request(uniqueKey()));
+
+        // then
+        assertEquals("*/*", fake.lastFiscalPrintAccept());
+    }
+
+    private int fiscalPrintRequests() {
+        return (int) fake.requestLog().stream().filter(line -> line.startsWith("GET /invoices/fiscal_print")).count();
+    }
+
     // ---- error classification -----------------------------------------------------------------------
 
     @Test
@@ -355,6 +460,42 @@ class FakturowniaReceiptProviderTest {
         // then
         ReceiptRejectedException rejected = assertExactly(ReceiptRejectedException.class, thrown);
         assertTrue(rejected.getMessage().contains("Drukarka nie jest przypisana"));
+    }
+
+    @Test
+    void fiscalPrintBadRequestIsRejected() {
+        // given
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(400, "{\"code\":\"error\",\"message\":\"Nieprawidłowe parametry\"}"));
+
+        // when / then
+        assertExactly(ReceiptRejectedException.class, assertThrows(ReceiptException.class, () -> provider.issue(request(uniqueKey()))));
+    }
+
+    @Test
+    void oidConflictIsOutcomeUnknownEvenWhenTheLookupMissesTheReceipt() {
+        // given: fiscalisation was ordered but its answer lost; afterwards the oid search stops finding the receipt
+        ReceiptRequest request = request(uniqueKey());
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.DropAfterApplying());
+        assertExactly(ReceiptOutcomeUnknownException.class, assertThrows(ReceiptException.class, () -> provider.issue(request)));
+        fake.failNext(Endpoint.LIST, new Fault.Status(200, "[]"));
+        fake.failNext(Endpoint.LIST, new Fault.Status(200, "[]"));
+
+        // when: the retry's create hits oid_unique (422 {"message":{"oid":[...]}})
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request));
+
+        // then
+        assertExactly(ReceiptOutcomeUnknownException.class, thrown);
+        assertEquals(1, fake.createCalls());
+        assertEquals(1, fake.fiscalPrintCalls());
+    }
+
+    @Test
+    void createErrorNamingOidInPlainTextIsOutcomeUnknown() {
+        // given
+        fake.failNext(Endpoint.CREATE, new Fault.Status(422, "{\"code\":\"error\",\"message\":\"Oid jest już zajęte\"}"));
+
+        // when / then
+        assertExactly(ReceiptOutcomeUnknownException.class, assertThrows(ReceiptException.class, () -> provider.issue(request(uniqueKey()))));
     }
 
     @Test

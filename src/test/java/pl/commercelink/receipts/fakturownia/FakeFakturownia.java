@@ -50,6 +50,9 @@ final class FakeFakturownia implements AutoCloseable {
 
         /** Apply the call, then close the connection without answering. */
         record DropAfterApplying() implements Fault {}
+
+        /** Answer normally (lets a queue of faults skip a call). */
+        record Pass() implements Fault {}
     }
 
     private static final Pattern DOCUMENT = Pattern.compile("^/invoices/([^/]+)\\.json$");
@@ -66,6 +69,9 @@ final class FakeFakturownia implements AutoCloseable {
     private int createCalls;
     private int fiscalPrintCalls;
     private int requests;
+    private boolean listOmitsInternalNote;
+    private boolean ignoreInternalNoteUpdates;
+    private String lastFiscalPrintAccept;
 
     FakeFakturownia() {
         try {
@@ -96,6 +102,21 @@ final class FakeFakturownia implements AutoCloseable {
 
     synchronized void failAlways(Endpoint endpoint, Fault fault) {
         permanentFaults.put(endpoint, fault);
+    }
+
+    /** The list endpoint leaves {@code internal_note} out of its documents (its fields are undocumented). */
+    synchronized void listOmitsInternalNote() {
+        listOmitsInternalNote = true;
+    }
+
+    /** A PUT answers 200 but does not persist {@code internal_note} (whether receipts accept it is undocumented). */
+    synchronized void ignoreInternalNoteUpdates() {
+        ignoreInternalNoteUpdates = true;
+    }
+
+    /** The {@code Accept} header of the last {@code fiscal_print} request. */
+    synchronized String lastFiscalPrintAccept() {
+        return lastFiscalPrintAccept;
     }
 
     /** The printer fiscalised the sale and the hub issued the e-receipt. */
@@ -159,6 +180,9 @@ final class FakeFakturownia implements AutoCloseable {
                 requests++;
                 requestLog.add(method + " " + path + (rawQuery == null ? "" : "?" + rawQuery));
                 fault = endpoint == null ? null : takeFault(endpoint);
+                if (endpoint == Endpoint.FISCAL_PRINT) {
+                    lastFiscalPrintAccept = exchange.getRequestHeaders().getFirst("Accept");
+                }
             }
             if (!("Bearer " + API_KEY).equals(exchange.getRequestHeaders().getFirst("Authorization"))) {
                 respond(exchange, 401, "{\"code\":\"error\",\"message\":\"Unauthorized\"}");
@@ -234,7 +258,11 @@ final class FakeFakturownia implements AutoCloseable {
             if (query.containsKey("department_id") && !query.get("department_id").equals(invoice.path("department_id").asText())) {
                 continue;
             }
-            result.add(invoice.deepCopy());
+            ObjectNode copy = invoice.deepCopy();
+            if (listOmitsInternalNote) {
+                copy.remove("internal_note");
+            }
+            result.add(copy);
         }
         return new Answer(200, result.toString());
     }
@@ -249,7 +277,11 @@ final class FakeFakturownia implements AutoCloseable {
         if (invoice == null) {
             return notFound();
         }
-        invoice.setAll(changes);
+        ObjectNode applied = changes.deepCopy();
+        if (ignoreInternalNoteUpdates) {
+            applied.remove("internal_note");
+        }
+        invoice.setAll(applied);
         invoice.put("updated_at", "2026-09-22T12:00:30.000+02:00");
         return new Answer(200, invoice.toString());
     }
