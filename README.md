@@ -92,10 +92,12 @@ only the retry orders it.
 - An online fiscal printer supporting e-receipts (Posnet, Novitus or STX protocol) connected to Fakturownia through
   the **Paragony.pl module ≥ 3.3.0**, running and online.
 - **E-receipts enabled** on the account: *Ustawienia › Ustawienia konta › Inne*.
-- **"Automatyczna fiskalizacja paragonów po utworzeniu przez API" must be OFF.** It applies to every receipt created
-  through the API on the account, by any integration. The adapter never orders a receipt that already has a
-  `fiscal_status`, so with the option on the receipts are fiscalised once (by the account, not by the adapter) and
-  still reported correctly. The option cannot be read through the API.
+- **"Automatyczna fiskalizacja paragonów po utworzeniu przez API" must be OFF.** The option applies to every receipt
+  created through the API on the account, by any integration, and orders fiscalisation in the printer's default mode
+  (paper unless e-receipt is set as the printer's default), while the adapter orders `mode=e-receipt` itself. As a
+  safety net the adapter never orders a receipt that already has a `fiscal_status`, so an account with the option on
+  is fiscalised once, by the account — provided Fakturownia sets `fiscal_status` when the receipt is created, which
+  is still to be confirmed on a live account. The option cannot be read through the API.
 - The printer has every VAT rate that receipts use configured (A=23, B=8, C=5, D=0, E=zw) and the Mazovia code page
   for Polish characters.
 - The API token belongs to a user allowed to issue documents: with a read-only role Fakturownia answers `200` to a
@@ -142,7 +144,8 @@ well — both are harmless because the executor only reads.
 - Lines worth 0 PLN are refused (`ReceiptValidationException`): fiscal printers reject them.
 - `PaymentForm`: `CASH` → `cash`, `CARD` → `card`, `TRANSFER` → `transfer`. `MOBILE`/`VOUCHER`/`CREDIT`/`OTHER`
   → the payment's label, or "Płatność mobilna"/"Bon"/"Kredyt"/"Inna". Printers show `cash`/`card`/`transfer` as
-  Gotówka/Karta/Przelew; any other text is printed as "INNA (text)".
+  Gotówka/Karta/Przelew; any other text is printed as "INNA (text)" (Fakturownia help; to confirm on the printer's
+  daily report).
   - Fakturownia records one payment type per document, so payments that map to different types are refused.
 - Line names: `&` → "i"; `^ % $ # @ *` removed (the printer refuses them with error [16]); whitespace collapsed; the
   name is cut to `lineNameLength`.
@@ -173,7 +176,6 @@ Verified only against a fake backend built from the documentation (no test accou
 - the fields holding the fiscal receipt number and the cash register's unique number (none are documented);
 - the response of `fiscal_print`, the exact `oid_unique` error, and whether the `oid` filter matches exactly (the
   adapter filters exactly itself);
-- the `calculating_strategy` value that matches "zgodnie z kasą fiskalną", and how `payment_type` is printed;
 - `Authorization: Bearer` on every endpoint used (documented in the e-receipt guide; `api_token` is the fallback);
 - whether `status: "rejected"` can be set on a receipt at all (cancellation cannot); the adapter no longer depends on it;
 - whether `internal_note` can be written on a `kind: receipt` document (if not, `issue` never orders fiscalisation and
