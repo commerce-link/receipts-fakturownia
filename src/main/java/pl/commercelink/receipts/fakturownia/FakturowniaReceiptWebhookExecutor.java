@@ -76,7 +76,7 @@ final class FakturowniaReceiptWebhookExecutor implements WebhookExecutor<Receipt
             FakturowniaReceiptConfig config = FakturowniaReceiptConfig.from(context.providerConfig());
             JsonNode document = new FakturowniaReceiptsApi(config.apiUrl(), config.apiKey(), timeout).getReceipt(id);
             if (!FakturowniaReceiptMapper.isReceipt(document)
-                    || !config.departmentId().equals(FakturowniaReceiptMapper.text(document, "department_id"))
+                    || !FakturowniaReceiptMapper.inDepartment(document, config.departmentId())
                     || !isReceiptKey(FakturowniaReceiptMapper.text(document, "oid"))) {
                 return WebhookOutcome.empty();
             }
@@ -90,6 +90,8 @@ final class FakturowniaReceiptWebhookExecutor implements WebhookExecutor<Receipt
         if (expected == null || expected.isBlank() || actual == null) {
             return false;
         }
+        // the configured value is stripped like every other setting: a pasted trailing newline must not reject all webhooks
+        expected = expected.strip();
         return MessageDigest.isEqual(expected.getBytes(StandardCharsets.UTF_8), actual.getBytes(StandardCharsets.UTF_8));
     }
 

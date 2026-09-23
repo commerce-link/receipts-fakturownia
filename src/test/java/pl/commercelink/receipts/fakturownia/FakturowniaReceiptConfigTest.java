@@ -85,6 +85,43 @@ class FakturowniaReceiptConfigTest {
     }
 
     @Test
+    void refusesPlainHttpExceptForLoopbackHosts() {
+        // when
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> FakturowniaReceiptConfig.from(config("apiUrl", "http://shop.fakturownia.pl")));
+
+        // then
+        assertTrue(refused.getMessage().contains("apiUrl"), refused.getMessage());
+        assertEquals("http://127.0.0.1:8080", FakturowniaReceiptConfig.from(config("apiUrl", "http://127.0.0.1:8080")).apiUrl());
+        assertEquals("http://localhost:8080", FakturowniaReceiptConfig.from(config("apiUrl", "http://localhost:8080/")).apiUrl());
+        assertEquals("http://[::1]:8080", FakturowniaReceiptConfig.from(config("apiUrl", "http://[::1]:8080")).apiUrl());
+    }
+
+    @Test
+    void refusesAnApiUrlWithPathQueryOrFragment() {
+        for (String url : List.of("https://shop.fakturownia.pl/api", "https://shop.fakturownia.pl/?x=1",
+                "https://shop.fakturownia.pl#", "https://shop.fakturownia.pl/#top")) {
+            // when
+            IllegalArgumentException refused = assertThrows(IllegalArgumentException.class, () -> FakturowniaReceiptConfig.from(config("apiUrl", url)));
+
+            // then
+            assertTrue(refused.getMessage().contains("apiUrl"), url + ": " + refused.getMessage());
+        }
+    }
+
+    @Test
+    void refusesAnApiKeyThatIsNotAValidHeaderValue() {
+        for (String key : List.of("tok\r\nX-Injected: 1", "tok\nen", "tok\ten", "tok en", "tokeń", "tok\u007Fen")) {
+            // when
+            IllegalArgumentException refused = assertThrows(IllegalArgumentException.class, () -> FakturowniaReceiptConfig.from(config("apiKey", key)));
+
+            // then
+            assertTrue(refused.getMessage().contains("apiKey"), refused.getMessage());
+            assertFalse(refused.getMessage().contains("tok"), "the key must not leak into the message: " + refused.getMessage());
+        }
+    }
+
+    @Test
     void refusesALineNameLengthOutsideOneToForty() {
         assertThrows(IllegalArgumentException.class, () -> FakturowniaReceiptConfig.from(config("lineNameLength", "0")));
         assertThrows(IllegalArgumentException.class, () -> FakturowniaReceiptConfig.from(config("lineNameLength", "41")));

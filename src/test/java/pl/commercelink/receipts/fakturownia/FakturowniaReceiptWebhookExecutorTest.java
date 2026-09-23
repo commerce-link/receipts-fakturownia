@@ -109,6 +109,35 @@ class FakturowniaReceiptWebhookExecutorTest {
     }
 
     @Test
+    void configuredTokenIsStrippedBeforeComparing() {
+        // given
+        storedReceipt("2008");
+        Map<String, String> config = new java.util.HashMap<>(FakturowniaTestSupport.config(fake));
+        config.put(FakturowniaReceiptConfig.WEBHOOK_TOKEN, " " + WEBHOOK_TOKEN + "\n");
+
+        // when
+        WebhookOutcome<Receipt> outcome = executor.execute(
+                FakturowniaReceiptWebhookContractTest.webhookAbout("2008", "receipt", WEBHOOK_TOKEN).payload(), new WebhookContext(Map.of(), config));
+
+        // then
+        assertEquals("2008", outcome.result().providerReceiptId());
+    }
+
+    @Test
+    void blankConfiguredTokenRejectsEverything() {
+        // given
+        Map<String, String> config = new java.util.HashMap<>(FakturowniaTestSupport.config(fake));
+        config.put(FakturowniaReceiptConfig.WEBHOOK_TOKEN, " \n");
+
+        // when
+        WebhookOutcome<Receipt> outcome = executor.execute(
+                FakturowniaReceiptWebhookContractTest.webhookAbout("2001", "receipt", "").payload(), new WebhookContext(Map.of(), config));
+
+        // then
+        assertRejected(outcome);
+    }
+
+    @Test
     void unreadableBodyIsRejected() {
         assertRejected(execute("not json"));
         assertRejected(execute("[]"));
@@ -137,6 +166,18 @@ class FakturowniaReceiptWebhookExecutorTest {
 
         // when / then
         assertEmpty(execute(FakturowniaReceiptWebhookContractTest.webhookAbout("2003", "receipt", WEBHOOK_TOKEN).payload()));
+    }
+
+    @Test
+    void receiptWithoutDepartmentIsAcceptedLikeInFind() {
+        // given
+        storedReceipt("2009").remove("department_id");
+
+        // when
+        WebhookOutcome<Receipt> outcome = execute(FakturowniaReceiptWebhookContractTest.webhookAbout("2009", "receipt", WEBHOOK_TOKEN).payload());
+
+        // then
+        assertEquals("2009", outcome.result().providerReceiptId());
     }
 
     @Test

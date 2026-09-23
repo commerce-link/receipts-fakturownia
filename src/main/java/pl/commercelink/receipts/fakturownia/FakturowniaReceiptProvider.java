@@ -142,8 +142,7 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
 
     /** The list call already filters by department; a document that states another department is still skipped. */
     private boolean inConfiguredDepartment(JsonNode document) {
-        String department = FakturowniaReceiptMapper.text(document, "department_id");
-        return department == null || department.equals(config.departmentId());
+        return FakturowniaReceiptMapper.inDepartment(document, config.departmentId());
     }
 
     /** {@code GET /invoices/{id}.json} during issue; any failure is a plain {@link ReceiptException} (a read changes nothing). */

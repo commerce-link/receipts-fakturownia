@@ -205,6 +205,16 @@ final class FakturowniaReceiptMapper {
         return note != null && note.contains(FISCAL_PRINT_MARKER);
     }
 
+    /**
+     * The one department rule shared by {@code find} and the webhook: a document stating another department is
+     * foreign; a document without {@code department_id} is accepted (the list call already filters by
+     * department, and a read by id must not turn every webhook into a no-op should Fakturownia omit the field).
+     */
+    static boolean inDepartment(JsonNode document, String departmentId) {
+        String department = text(document, "department_id");
+        return department == null || department.equals(departmentId);
+    }
+
     static boolean isReceipt(JsonNode document) {
         return "receipt".equals(text(document, "kind"));
     }

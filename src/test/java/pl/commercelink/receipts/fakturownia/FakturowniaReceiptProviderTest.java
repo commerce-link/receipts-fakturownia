@@ -364,6 +364,21 @@ class FakturowniaReceiptProviderTest {
     }
 
     @Test
+    void findAcceptsADocumentWithoutDepartment() {
+        // given
+        String key = uniqueKey();
+        Receipt issued = provider.issue(request(key));
+        fake.invoice(issued.providerReceiptId()).remove("department_id");
+        fake.failNext(Endpoint.LIST, new Fault.Status(200, "[" + fake.invoice(issued.providerReceiptId()) + "]"));
+
+        // when
+        Optional<Receipt> found = provider.find(key);
+
+        // then
+        assertEquals(issued.providerReceiptId(), found.orElseThrow().providerReceiptId());
+    }
+
+    @Test
     void createConflictWithoutAMatchingReceiptIsOutcomeUnknown() {
         // given
         fake.failNext(Endpoint.CREATE, new Fault.Status(409, "{\"code\":\"error\",\"message\":\"Conflict\"}"));
