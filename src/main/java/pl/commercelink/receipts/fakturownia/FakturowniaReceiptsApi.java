@@ -32,6 +32,12 @@ class FakturowniaReceiptsApi {
 
     static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);
 
+    /** Page size of the lookup by {@code oid}; a page this full may hide the exact match on a later page. */
+    static final int LOOKUP_PAGE_SIZE = 100;
+
+    static final String FULL_LOOKUP_PAGE =
+            "Lookup by oid returned a full page (100); the oid filter is not exact, refusing to decide";
+
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
 
     private static final HttpClient SHARED_CLIENT = HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT).build();
@@ -62,17 +68,22 @@ class FakturowniaReceiptsApi {
 
     /**
      * {@code GET /invoices.json?oid=…&kind=receipt&period=all&department_id=…&per_page=100}. The server-side
-     * {@code oid} filter may match more than the exact value; callers filter the result.
+     * {@code oid} filter may match more than the exact value; callers filter the result. A full page is thrown as
+     * {@link FakturowniaApiException.Kind#SENT_NO_ANSWER} with {@link #FULL_LOOKUP_PAGE}: the exact match may sit
+     * on a page that was not read, so the answer cannot tell whether the receipt exists.
      */
     List<JsonNode> findReceiptsByOid(String oid, String departmentId) {
         String query = "?oid=" + encode(oid) + "&kind=receipt&period=all&department_id=" + encode(departmentId)
-                + "&per_page=100";
+                + "&per_page=" + LOOKUP_PAGE_SIZE;
         JsonNode list = readJson(send(request("/invoices.json" + query).GET()));
         if (!list.isArray()) {
             throw FakturowniaApiException.sentNoAnswer("Expected a JSON array from /invoices.json, got: " + list, null);
         }
         List<JsonNode> result = new ArrayList<>();
         list.forEach(result::add);
+        if (result.size() >= LOOKUP_PAGE_SIZE) {
+            throw FakturowniaApiException.sentNoAnswer(FULL_LOOKUP_PAGE, null);
+        }
         return result;
     }
 

@@ -291,22 +291,6 @@ class FakturowniaReceiptMapperTest {
         assertThrows(ReceiptValidationException.class, () -> mapper.toInvoice(request));
     }
 
-    @Test
-    void zeroValueLineIsRefused() {
-        // given
-        ReceiptRequest request = base()
-                .line(ReceiptLine.goods("Mysz", BigDecimal.ONE, Money.ofGrosze(9999), VatRate.VAT_23))
-                .line(ReceiptLine.shipping("Dostawa gratis", Money.ZERO, VatRate.VAT_23))
-                .payment(ReceiptPayment.of(PaymentForm.CARD, Money.ofGrosze(9999)))
-                .build();
-
-        // when
-        ReceiptValidationException refused = assertThrows(ReceiptValidationException.class, () -> mapper.toInvoice(request));
-
-        // then
-        assertTrue(refused.getMessage().contains("line 1"), refused.getMessage());
-    }
-
     // ---- document -> Receipt ---------------------------------------------------------------------------
 
     private static ObjectNode document() {
@@ -476,5 +460,28 @@ class FakturowniaReceiptMapperTest {
         assertTrue(FakturowniaReceiptMapper.hasFiscalPrintMarker(document().put("internal_note", "operator: x\ncommercelink:fiscal-print-ordered")));
         assertFalse(FakturowniaReceiptMapper.hasFiscalPrintMarker(document().put("internal_note", "")));
         assertFalse(FakturowniaReceiptMapper.hasFiscalPrintMarker(document()));
+    }
+
+    @Test
+    void markerIsAppendedToTheOperatorNote() {
+        String marker = FakturowniaReceiptMapper.FISCAL_PRINT_MARKER;
+        assertEquals(marker, FakturowniaReceiptMapper.withMarker(null));
+        assertEquals(marker, FakturowniaReceiptMapper.withMarker(""));
+        assertEquals(marker, FakturowniaReceiptMapper.withMarker("  \n"));
+        assertEquals("Klient odbierze w sobotę\n" + marker, FakturowniaReceiptMapper.withMarker("Klient odbierze w sobotę"));
+        assertTrue(FakturowniaReceiptMapper.hasFiscalPrintMarker(
+                document().put("internal_note", FakturowniaReceiptMapper.withMarker("Klient odbierze w sobotę"))));
+    }
+
+    @Test
+    void markerRemovalKeepsTheOperatorNote() {
+        String marker = FakturowniaReceiptMapper.FISCAL_PRINT_MARKER;
+        assertEquals("", FakturowniaReceiptMapper.withoutMarker(null));
+        assertEquals("", FakturowniaReceiptMapper.withoutMarker(marker));
+        assertEquals("Klient odbierze w sobotę", FakturowniaReceiptMapper.withoutMarker("Klient odbierze w sobotę\n" + marker));
+        assertEquals("linia 1\nlinia 2", FakturowniaReceiptMapper.withoutMarker("linia 1\n" + marker + "\nlinia 2"));
+        assertEquals("Klient odbierze w sobotę", FakturowniaReceiptMapper.withoutMarker("Klient odbierze w sobotę"));
+        assertFalse(FakturowniaReceiptMapper.hasFiscalPrintMarker(document().put("internal_note",
+                FakturowniaReceiptMapper.withoutMarker(FakturowniaReceiptMapper.withMarker("Klient odbierze w sobotę")))));
     }
 }

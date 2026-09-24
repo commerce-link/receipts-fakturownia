@@ -15,6 +15,7 @@ import pl.commercelink.receipts.api.ReceiptValidationException;
 import java.time.Clock;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /**
@@ -28,16 +29,32 @@ import java.util.stream.Collectors;
  */
 public final class FakturowniaReceiptProvider implements ReceiptProvider {
 
+    /** Tries of a call that is safe to repeat, and the pauses between them (see {@link #withRetries}). */
+    private static final int TRIES = 3;
+    private static final long[] PAUSES_MILLIS = {1000, 2000};
+
     private final FakturowniaReceiptsApi api;
     private final FakturowniaReceiptConfig config;
     private final FakturowniaReceiptMapper mapper;
     private final Clock clock;
+    private final Sleeper sleeper;
+
+    /** Pauses between tries of a retried call; injectable so tests do not wait. */
+    @FunctionalInterface
+    interface Sleeper {
+        void sleep(long millis) throws InterruptedException;
+    }
 
     FakturowniaReceiptProvider(FakturowniaReceiptsApi api, FakturowniaReceiptConfig config, Clock clock) {
+        this(api, config, clock, Thread::sleep);
+    }
+
+    FakturowniaReceiptProvider(FakturowniaReceiptsApi api, FakturowniaReceiptConfig config, Clock clock, Sleeper sleeper) {
         this.api = api;
         this.config = config;
         this.mapper = new FakturowniaReceiptMapper(config.departmentId(), config.lineNameLength());
         this.clock = clock;
+        this.sleeper = sleeper;
     }
 
     @Override
@@ -69,17 +86,30 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
             // Fakturownia does not refuse a second order for a queued receipt, so ordering again fiscalises twice.
             return current;
         }
+        // The marker is appended to the operator's private note, which is restored whenever the marker is removed.
+        // A marker PUT whose answer is lost stays an unknown outcome: the marker is assumed set.
+        String originalNote = Optional.ofNullable(FakturowniaReceiptMapper.text(document, "internal_note")).orElse("");
         try {
-            api.updateInternalNote(id, FakturowniaReceiptMapper.FISCAL_PRINT_MARKER);
+            api.updateInternalNote(id, FakturowniaReceiptMapper.withMarker(originalNote));
         } catch (FakturowniaApiException e) {
             throw afterSending("Marking receipt " + id + " before fiscalisation", e);
         }
         // Order fiscalisation only once the marker is confirmed by a fresh read, so a PUT that Fakturownia
-        // accepted but did not persist can never lead to a second order on a retry. If this read fails, the
-        // marker is most likely set, so every retry returns PENDING without ordering: the receipt then waits
-        // for the operator, exactly like a lost fiscal_print answer. That is the accepted price of at most once.
-        JsonNode marked = read(id, "Confirming the fiscal-print marker of receipt " + id
-                + " (fiscalisation was not ordered)");
+        // accepted but did not persist can never lead to a second order on a retry. The read is retried on a
+        // rate limit; if it still fails, nothing was ordered, so the marker is removed and the retry orders. Only
+        // when the removal fails too does the marker stay, and the receipt then waits PENDING for the operator.
+        JsonNode marked;
+        try {
+            marked = withRetries(() -> api.getReceipt(id));
+        } catch (FakturowniaApiException e) {
+            if (clearMarker(id, originalNote)) {
+                throw new ReceiptException("Confirming the fiscal-print marker of receipt " + id + " failed;"
+                        + " fiscalisation was not ordered and the marker was removed, retry with the same key", e);
+            }
+            throw new ReceiptException("Confirming the fiscal-print marker of receipt " + id + " (fiscalisation was not"
+                    + " ordered) failed: " + e.getMessage() + "; removing the marker failed too, so the marker stays and"
+                    + " the receipt waits PENDING for the operator", e);
+        }
         if (!FakturowniaReceiptMapper.hasFiscalPrintMarker(marked)) {
             throw new ReceiptException("The fiscal-print marker of receipt " + id
                     + " could not be confirmed; fiscalisation was not ordered");
@@ -88,7 +118,7 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
             // queued by someone else between the two reads
             return Receipt.pending(key, id);
         }
-        return orderFiscalPrint(key, id);
+        return orderFiscalPrint(key, id, originalNote);
     }
 
     private static ReceiptRejectedException willNotBeFiscalised(String key, String id, Receipt failed) {
@@ -137,11 +167,6 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
         return true;
     }
 
-    @Override
-    public boolean pushesStatusUpdates() {
-        return true;
-    }
-
     /**
      * The receipt stored under this exact {@code oid} in the configured department. More than one is an anomaly
      * (a lost create that surfaced late, or {@code oid_unique} not enforced): which one to fiscalise is the
@@ -156,6 +181,12 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
                     .filter(this::inConfiguredDepartment)
                     .toList();
         } catch (FakturowniaApiException e) {
+            if (e.kind() == FakturowniaApiException.Kind.SENT_NO_ANSWER
+                    && FakturowniaReceiptsApi.FULL_LOOKUP_PAGE.equals(e.getMessage())) {
+                // Retrying cannot help: the same query fills the page again. Creating could duplicate the receipt.
+                throw new ReceiptOutcomeUnknownException("Looking up receipt " + key + " is inconclusive: "
+                        + e.getMessage() + "; nothing is created or ordered until the operator resolves it", e);
+            }
             throw new ReceiptException("Looking up receipt " + key + " failed: " + e.getMessage(), e);
         }
         if (matches.size() > 1) {
@@ -216,14 +247,15 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
     }
 
     /**
-     * Orders fiscalisation and returns the receipt as PENDING. When the order certainly did not run (not sent,
-     * 401/403/404/429), the marker is removed on a best-effort basis so a retry with the same key can order again.
+     * Orders fiscalisation and returns the receipt as PENDING; never retried. When the order certainly did not run
+     * (not sent, 401/403/404/429), the marker is removed (see {@link #clearMarker}) so a retry with the same key can
+     * order again.
      * A 400/422 is checked against a fresh read first (see {@link #afterFiscalPrintRefusal}). Every other answer —
      * a redirect, any other 4xx, 5xx or no answer — may have been sent after the job was queued, so the marker
      * stays and the outcome is unknown: the receipt stays PENDING for the operator rather than risking a second
      * fiscalisation.
      */
-    private Receipt orderFiscalPrint(String key, String id) {
+    private Receipt orderFiscalPrint(String key, String id, String originalNote) {
         try {
             api.orderFiscalPrint(id, config.printerId());
             return Receipt.pending(key, id);
@@ -232,13 +264,17 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
             boolean certainlyNotRun = e.kind() == FakturowniaApiException.Kind.NOT_SENT
                     || (http && nothingHappened(e.status()));
             if (certainlyNotRun) {
-                clearMarker(id);
-                throw new ReceiptException("Ordering fiscalisation of receipt " + id + " did not run: " + e.getMessage(), e);
+                String marker = clearMarker(id, originalNote)
+                        ? "the marker was removed, retry with the same key"
+                        : "removing the marker failed, so the marker stays and the receipt waits PENDING for the operator";
+                throw new ReceiptException("Ordering fiscalisation of receipt " + id + " did not run: " + e.getMessage()
+                        + "; " + marker, e);
             }
             if (http && (e.status() == 400 || e.status() == 422)) {
                 return afterFiscalPrintRefusal(key, id, e);
             }
-            throw new ReceiptOutcomeUnknownException("Ordering fiscalisation of receipt " + id + ": " + e.getMessage(), e);
+            throw new ReceiptOutcomeUnknownException("Ordering fiscalisation of receipt " + id + ": " + e.getMessage()
+                    + "; the marker stays", e);
         }
     }
 
@@ -257,7 +293,8 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
         try {
             document = api.getReceipt(id);
         } catch (FakturowniaApiException e) {
-            throw new ReceiptOutcomeUnknownException(refused + " and re-reading it failed: " + e.getMessage(), e);
+            throw new ReceiptOutcomeUnknownException(refused + " and re-reading it failed: " + e.getMessage()
+                    + "; the marker stays", e);
         }
         if (!FakturowniaReceiptMapper.hasFiscalStatus(document)
                 && FakturowniaReceiptMapper.text(document, "e_receipt_view_url") == null) {
@@ -271,11 +308,54 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
         return current;
     }
 
-    private void clearMarker(String id) {
+    /**
+     * Removes the marker once fiscalisation certainly was not ordered, restoring the operator's note as read before
+     * the marker was written. Returns whether the removal was confirmed by Fakturownia; when it was not, the marker
+     * stays (or its removal is unknown) and the receipt remains PENDING until the operator fiscalises it by hand.
+     */
+    private boolean clearMarker(String id, String originalNote) {
         try {
-            api.updateInternalNote(id, "");
-        } catch (FakturowniaApiException ignored) {
-            // the marker stays: the receipt remains PENDING until the operator fiscalises it by hand
+            withRetries(() -> {
+                api.updateInternalNote(id, FakturowniaReceiptMapper.withoutMarker(originalNote));
+                return null;
+            });
+            return true;
+        } catch (FakturowniaApiException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Runs a call that is safe to repeat (a read, or the marker removal) up to {@link #TRIES} times, pausing
+     * {@link #PAUSES_MILLIS} between tries, but only after a failure that certainly changed nothing and may pass on
+     * its own: the per-IP rate limit (HTTP 429) or a request that was never sent. Fakturownia allows two concurrent
+     * requests per IP, so 429s are expected under load. An interrupted pause restores the flag and stops retrying.
+     * Never used for creating a receipt, writing the marker or ordering fiscalisation.
+     */
+    private <T> T withRetries(Supplier<T> call) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return call.get();
+            } catch (FakturowniaApiException e) {
+                if (attempt >= TRIES || !transientFailure(e) || !pause(PAUSES_MILLIS[attempt - 1])) {
+                    throw e;
+                }
+            }
+        }
+    }
+
+    private static boolean transientFailure(FakturowniaApiException e) {
+        return e.kind() == FakturowniaApiException.Kind.NOT_SENT
+                || (e.kind() == FakturowniaApiException.Kind.HTTP && e.status() == 429);
+    }
+
+    private boolean pause(long millis) {
+        try {
+            sleeper.sleep(millis);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
         }
     }
 

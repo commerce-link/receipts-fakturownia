@@ -7,7 +7,7 @@ of its own: receipts are Fakturownia documents (`kind: "receipt"`) created throu
 
 - Descriptor: `FakturowniaReceiptProviderDescriptor`, `name()` = `fakturownia`, `displayName()` = "Paragony.pl (Fakturownia)".
 - Issues `ELECTRONIC` receipts only. The adapter never e-mails the buyer: the consumer delivers the e-receipt link.
-- `requiresBuyerEmail()` = `true`, `pushesStatusUpdates()` = `true`, `maxLineNameLength()` = configured (default 40).
+- `requiresBuyerEmail()` = `true`, `maxLineNameLength()` = configured (default 40).
 
 ## How a receipt is fiscalised
 
@@ -19,14 +19,17 @@ If the printer or the module is off, the receipt stays pending, possibly for hou
 `issue` is a state machine resumed by receipt key (the key is stored as the document's `oid`):
 
 1. look the receipt up (`GET /invoices.json?oid=…&kind=receipt&period=all&department_id=…&per_page=100`, exact
-   match on our side);
+   match on our side). A full page (100 documents) is inconclusive, because the exact match may sit on a page that
+   was not read: `ReceiptOutcomeUnknownException`, and nothing is created or ordered;
 2. create it when absent (`POST /invoices.json` with `oid_unique: "yes"`);
 3. re-read the full document by id (`GET /invoices/{id}.json`) and decide on it, never on the list or create
    answer: a fiscalised `fiscal_status` or an e-receipt link → `FISCALISED`; `fiscal_status: "error"` →
    `ReceiptRejectedException` (`fiscal_error`, issue with a new key); any other `fiscal_status` (queued, printing,
    set by the operator or by the account's automatic fiscalisation) or our marker → `PENDING` without ordering;
-4. write the marker `commercelink:fiscal-print-ordered` into the private note (`internal_note`), then read the
-   document again and continue only if the marker is there;
+4. append the marker `commercelink:fiscal-print-ordered` as its own line to the private note (`internal_note`),
+   keeping whatever the operator wrote there, then read the document again and continue only if the marker is
+   there. That confirming read is retried after a rate limit (HTTP 429) or a request that was never sent: three
+   tries, 1 s and then 2 s apart;
 5. if that confirming read also shows a `fiscal_status` (someone queued the receipt meanwhile), stop with `PENDING`
    without ordering;
 6. order fiscalisation (`GET /invoices/fiscal_print?id=…&mode=e-receipt[&fiskator_name=…]`, `Accept: */*`) → `PENDING`.
@@ -43,9 +46,10 @@ connection (`OneShotHttpGet`), because both JDK HTTP clients silently resend a G
 connection before answering.
 
 Callers must not issue the same key concurrently. That includes a queue redelivering the message while the first
-`issue` still runs: `issue` makes up to seven sequential calls with a 30 s timeout each, so the consumer's queue
-visibility timeout must be at least 300 s (or be extended while issuing), and the consumer should hold a
-per-key lease. Two concurrent calls can both write the marker and both order fiscalisation.
+`issue` still runs: `issue` makes up to twelve sequential calls (seven, plus two more tries each for the confirming
+read and the marker removal) with a 30 s timeout each — a retried try failed fast, on a 429 or within the 10 s
+connect timeout — and pauses up to 6 s, so the consumer's queue visibility timeout must be at least 360 s (or be
+extended while issuing), and the consumer should hold a per-key lease. Two concurrent calls can both write the marker and both order fiscalisation.
 
 Fakturownia limits the API to 1000 requests per minute and two concurrent requests **per IP address**, so all
 stores and `invoicing-fakturownia` share one budget: the consumer needs one limiter for every call to Fakturownia.
@@ -83,10 +87,10 @@ edit of the document moves it; the consumer keeps the first value it saw. Faktur
 
 | Situation | Exception |
 |---|---|
-| invalid request, missing buyer e-mail, mixed payment forms, a name with only refused characters, a line worth 0 PLN (fiscal printers refuse it; the consumer leaves free lines out) | `ReceiptValidationException` |
-| Fakturownia unreachable, HTTP 401/403/404/429, a failed read of the document, a marker that could not be confirmed | `ReceiptException` (no fiscalisation was ordered in this call; retry with the same key) |
+| invalid request, missing buyer e-mail, mixed payment forms, a name with only refused characters | `ReceiptValidationException` |
+| Fakturownia unreachable, HTTP 401/403/404/429, a failed read of the document (including the confirming read after the marker), a marker that could not be confirmed | `ReceiptException` (no fiscalisation was ordered in this call; retry with the same key) |
 | HTTP 400/422 on create (unless the error names `oid`), 400/422 on `fiscal_print` when a fresh read shows neither a `fiscal_status` nor an e-receipt link, a receipt the printer refused (`fiscal_status: "error"`) or, without any fiscal status, one marked rejected/cancelled in Fakturownia | `ReceiptRejectedException` (issue with a new key) |
-| timeout or dropped connection after sending; 5xx; any other answer to `fiscal_print` (3xx, other 4xx); a receipt that appeared during create; a create error naming `oid` (the receipt exists but the lookup cannot find it); several receipts under one key; 400/422 on `fiscal_print` followed by a failed re-read | `ReceiptOutcomeUnknownException` (retry `issue` with the same key until another result; `find` only to diagnose) |
+| timeout or dropped connection after sending; 5xx; any other answer to `fiscal_print` (3xx, other 4xx); a receipt that appeared during create; a create error naming `oid` (the receipt exists but the lookup cannot find it); several receipts under one key; a full lookup page (100 documents for the `oid` filter); 400/422 on `fiscal_print` followed by a failed re-read | `ReceiptOutcomeUnknownException` (retry `issue` with the same key until another result; `find` only to diagnose) |
 
 `Rejected` makes the consumer issue a new receipt, which is fiscalised again, so it only follows when nothing was
 fiscalised under the key. A 400/422 from `fiscal_print` does not prove that on its own: Fakturownia also refuses to
@@ -98,8 +102,14 @@ unknown and the marker stays. `fiscal_print` is an undocumented UI-style route: 
 queued, so those leave the marker in place and the receipt waits as `PENDING` for the operator. A receipt that exists
 but cannot be found by `oid` stays `OutcomeUnknown` until the lookup finds it or the operator acts.
 
-When the confirming read after the marker fails, the marker is most likely set: every retry then returns `PENDING`
-without ordering, and the receipt needs the operator, exactly like a lost `fiscal_print` answer.
+Whenever fiscalisation certainly was not ordered — the confirming read after the marker failed, or `fiscal_print`
+was not sent or answered 401/403/404/429 — the adapter removes the marker again (restoring the operator's note) and
+throws `ReceiptException`, so the retry with the same key orders fiscalisation. `fiscal_print` itself is never
+retried within one call. The removal is retried like the confirming read (three tries, 1 s and 2 s apart, only after
+a 429 or a request that was never sent); only if it still fails does the marker stay, the exception says so, and
+every retry returns `PENDING` without ordering, like a lost `fiscal_print` answer. The marker stays on purpose after
+every ambiguous answer: a lost answer to the marker `PUT` (the marker is assumed set), and any answer to
+`fiscal_print` that may have come after the job was queued.
 
 After `ReceiptOutcomeUnknownException` the consumer retries `issue` with the same key even when `find` returns the
 receipt: a receipt whose create answer was lost exists as `PENDING` but has not been sent for fiscalisation, and
@@ -159,7 +169,7 @@ well — both are harmless because the executor only reads.
 ## Mapping
 
 - `VatRate`: 23/8/5/0 → `"23"`/`"8"`/`"5"`/`"0"`, `EXEMPT` → `"zw"`. `"np"` is never sent.
-- Lines worth 0 PLN are refused (`ReceiptValidationException`): fiscal printers reject them.
+- Lines worth 0 PLN never reach the adapter: `ReceiptRequest` refuses them, because fiscal printers reject them.
 - `PaymentForm`: `CASH` → `cash`, `CARD` → `card`, `TRANSFER` → `transfer`. `MOBILE`/`VOUCHER`/`CREDIT`/`OTHER`
   → the payment's label, or "Płatność mobilna"/"Bon"/"Kredyt"/"Inna". Printers show `cash`/`card`/`transfer` as
   Gotówka/Karta/Przelew; any other text is printed as "INNA (text)" (Fakturownia help; to confirm on the printer's
@@ -183,8 +193,15 @@ well — both are harmless because the executor only reads.
   at the start of shipping line names: printers refuse a name previously sold at a lower VAT rate.
 - **Receipt pending for long**: check `fiscal_status` in Fakturownia. `to_print*` / `printing` → the printer or the
   Paragony.pl module is off; start it, the queue has no time limit, but sales must be fiscalised within the month.
-  No `fiscal_status` but our marker → the order was lost; order the fiscal print by hand once. Never order by hand a
-  receipt that has any `fiscal_status`.
+  No `fiscal_status` but our marker → the order may have been lost; order the fiscal print by hand once. Never order
+  by hand a receipt that has any `fiscal_status`. The marker is left on a receipt only after an ambiguous answer (a
+  lost answer to the marker write or to `fiscal_print`, a `fiscal_print` redirect or other unexpected status) or when
+  removing it failed; whenever fiscalisation was certainly not ordered, the adapter removes it and the retry orders.
+- **Private note**: the adapter appends its marker as the last line of `internal_note` and keeps the operator's text,
+  also when it removes the marker. Edit the note freely, but never delete the marker line by hand.
+- **Lookup page full** (`ReceiptOutcomeUnknownException` "returned a full page"): 100 or more receipts matched the
+  `oid` filter, so the adapter cannot tell whether the key exists and creates nothing. Search Fakturownia for the
+  exact `oid`: if a receipt exists, handle it as above; escalate before issuing the sale any other way.
 - **`fiscal_print` refused** (400/422 while the document has neither a `fiscal_status` nor an e-receipt link,
   `ReceiptRejectedException`): a non-fiscal receipt with the marker stays in Fakturownia. After fixing the cause
   (e.g. assign the printer to the department), delete it only if it still has no `fiscal_status`; never order it by

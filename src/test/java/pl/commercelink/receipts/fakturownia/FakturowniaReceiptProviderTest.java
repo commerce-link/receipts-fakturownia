@@ -4,27 +4,21 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import pl.commercelink.receipts.api.Money;
-import pl.commercelink.receipts.api.PaymentForm;
 import pl.commercelink.receipts.api.Receipt;
-import pl.commercelink.receipts.api.ReceiptBuyer;
 import pl.commercelink.receipts.api.ReceiptException;
-import pl.commercelink.receipts.api.ReceiptLine;
 import pl.commercelink.receipts.api.ReceiptOutcomeUnknownException;
-import pl.commercelink.receipts.api.ReceiptPayment;
 import pl.commercelink.receipts.api.ReceiptRejectedException;
 import pl.commercelink.receipts.api.ReceiptRequest;
 import pl.commercelink.receipts.api.ReceiptState;
-import pl.commercelink.receipts.api.ReceiptValidationException;
-import pl.commercelink.receipts.api.VatRate;
 import pl.commercelink.receipts.fakturownia.FakeFakturownia.Endpoint;
 import pl.commercelink.receipts.fakturownia.FakeFakturownia.Fault;
 
-import java.math.BigDecimal;
-import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -36,7 +30,11 @@ import static pl.commercelink.receipts.fakturownia.FakturowniaTestSupport.unique
 class FakturowniaReceiptProviderTest {
 
     private final FakeFakturownia fake = new FakeFakturownia();
-    private final FakturowniaReceiptProvider provider = FakturowniaTestSupport.provider(fake, FakturowniaReceiptConfig.PRINTER_ID, "12");
+    private final List<Long> sleeps = new ArrayList<>();
+    private final FakturowniaReceiptProvider provider = FakturowniaTestSupport.provider(fake, sleeps::add, FakturowniaReceiptConfig.PRINTER_ID, "12");
+
+    private static final String TOO_MANY_REQUESTS = "{\"code\":\"error\",\"message\":\"Too many requests\"}";
+    private static final String OPERATOR_NOTE = "Klient odbierze w sobotę";
 
     @AfterEach
     void stop() {
@@ -237,24 +235,6 @@ class FakturowniaReceiptProviderTest {
         assertThrows(ReceiptOutcomeUnknownException.class, () -> provider.find(key));
     }
 
-    @Test
-    void zeroValueLineIsRefusedBeforeAnyRemoteCall() {
-        // given
-        ReceiptRequest request = ReceiptRequest.builder()
-                .receiptKey(uniqueKey())
-                .orderId("order-zero")
-                .saleDate(LocalDateTime.of(2026, 9, 22, 12, 0))
-                .line(ReceiptLine.goods("Kabel", BigDecimal.ONE, Money.ofGrosze(1000), VatRate.VAT_23))
-                .line(ReceiptLine.shipping("Dostawa gratis", Money.ZERO, VatRate.VAT_23))
-                .payment(ReceiptPayment.of(PaymentForm.CARD, Money.ofGrosze(1000)))
-                .buyer(ReceiptBuyer.builder().email("jan@example.com").build())
-                .build();
-
-        // when / then
-        assertThrows(ReceiptValidationException.class, () -> provider.issue(request));
-        assertEquals(0, fake.requests());
-    }
-
     // ---- lost responses: fiscalisation at most once ---------------------------------------------------
 
     @Test
@@ -304,8 +284,8 @@ class FakturowniaReceiptProviderTest {
     }
 
     @Test
-    void lostMarkerResponseLeavesReceiptPendingWithoutOrdering() {
-        // given
+    void lostMarkerWriteAnswerStillNeverOrdersTwice() {
+        // given: the marker PUT is persisted but its answer is lost
         ReceiptRequest request = request(uniqueKey());
         fake.failNext(Endpoint.UPDATE, new Fault.DropAfterApplying());
         assertExactly(ReceiptOutcomeUnknownException.class, assertThrows(ReceiptException.class, () -> provider.issue(request)));
@@ -315,7 +295,8 @@ class FakturowniaReceiptProviderTest {
 
         // then
         assertEquals(ReceiptState.PENDING, retried.state());
-        assertEquals(0, fake.fiscalPrintCalls(), "the marker was applied, so the adapter must not order fiscalisation");
+        assertEquals(0, fiscalPrintRequests(), "the marker was applied, so the adapter must not order fiscalisation");
+        assertEquals(FakturowniaReceiptMapper.FISCAL_PRINT_MARKER, fake.invoice(retried.providerReceiptId()).get("internal_note").asText());
     }
 
     @Test
@@ -367,18 +348,105 @@ class FakturowniaReceiptProviderTest {
     }
 
     @Test
-    void failedMarkerConfirmationIsReceiptExceptionAndTheRetryDoesNotOrder() {
-        // given: the read before the marker passes, the confirming read after it fails
+    void failedConfirmingReadClearsTheMarkerSoTheRetryOrders() {
+        // given: the read before the marker passes, the confirming read is rate-limited on every try
         ReceiptRequest request = request(uniqueKey());
         fake.failNext(Endpoint.GET, new Fault.Pass());
-        fake.failNext(Endpoint.GET, new Fault.Status(503, "busy"));
-        assertExactly(ReceiptException.class, assertThrows(ReceiptException.class, () -> provider.issue(request)));
+        fake.failNext(Endpoint.GET, new Fault.Status(429, TOO_MANY_REQUESTS));
+        fake.failNext(Endpoint.GET, new Fault.Status(429, TOO_MANY_REQUESTS));
+        fake.failNext(Endpoint.GET, new Fault.Status(429, TOO_MANY_REQUESTS));
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request));
+        String id = onlyInvoiceId();
+
+        // then: nothing was ordered and the marker is gone
+        assertExactly(ReceiptException.class, thrown);
+        assertTrue(thrown.getMessage().contains("the marker was removed"), thrown.getMessage());
+        assertEquals(0, fiscalPrintRequests());
+        assertMarkerGone(id);
+        assertEquals(List.of(1000L, 2000L), sleeps, "three tries, 1 s then 2 s apart");
 
         // when
         Receipt retried = provider.issue(request);
 
-        // then: the marker is set, so the receipt waits for the operator instead of being ordered
+        // then
         assertEquals(ReceiptState.PENDING, retried.state());
+        assertEquals(1, fake.fiscalPrintCalls(id));
+        assertEquals(1, fiscalPrintRequests());
+    }
+
+    @Test
+    void confirmingReadThatFailsWithoutRetryAlsoClearsTheMarker() {
+        // given: a 503 is not retried; the confirming read fails at once
+        ReceiptRequest request = request(uniqueKey());
+        fake.failNext(Endpoint.GET, new Fault.Pass());
+        fake.failNext(Endpoint.GET, new Fault.Status(503, "busy"));
+        assertExactly(ReceiptException.class, assertThrows(ReceiptException.class, () -> provider.issue(request)));
+        assertMarkerGone(onlyInvoiceId());
+        assertEquals(List.of(), sleeps);
+
+        // when
+        Receipt retried = provider.issue(request);
+
+        // then
+        assertEquals(ReceiptState.PENDING, retried.state());
+        assertEquals(1, fiscalPrintRequests());
+    }
+
+    @Test
+    void singleRateLimitOnTheConfirmingReadIsRetriedAndOrdersOnce() {
+        // given
+        fake.failNext(Endpoint.GET, new Fault.Pass());
+        fake.failNext(Endpoint.GET, new Fault.Status(429, TOO_MANY_REQUESTS));
+
+        // when
+        Receipt receipt = provider.issue(request(uniqueKey()));
+
+        // then
+        assertEquals(ReceiptState.PENDING, receipt.state());
+        assertEquals(1, fiscalPrintRequests());
+        assertEquals(List.of(1000L), sleeps);
+    }
+
+    @Test
+    void failedConfirmingReadWhoseMarkerCannotBeRemovedKeepsTheReceiptPendingWithoutOrdering() {
+        // given: the confirming read fails and so does the marker removal (500 is not retried)
+        ReceiptRequest request = request(uniqueKey());
+        fake.failNext(Endpoint.GET, new Fault.Pass());
+        fake.failNext(Endpoint.GET, new Fault.Status(503, "busy"));
+        fake.failNext(Endpoint.UPDATE, new Fault.Pass());
+        fake.failNext(Endpoint.UPDATE, new Fault.Status(500, "boom"));
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request));
+
+        // when
+        Receipt retried = provider.issue(request);
+
+        // then: the marker is most likely set, so the receipt waits for the operator instead of being ordered
+        assertExactly(ReceiptException.class, thrown);
+        assertTrue(thrown.getMessage().contains("the marker stays"), thrown.getMessage());
+        assertEquals(ReceiptState.PENDING, retried.state());
+        assertEquals(0, fiscalPrintRequests());
+    }
+
+    @Test
+    void interruptedBackOffStopsRetryingAndNeverOrders() {
+        // given: the confirming read is rate-limited and the pause before the next try is interrupted
+        FakturowniaReceiptProvider interrupted = FakturowniaTestSupport.provider(fake, millis -> {
+            throw new InterruptedException("shutdown");
+        }, FakturowniaReceiptConfig.PRINTER_ID, "12");
+        fake.failNext(Endpoint.GET, new Fault.Pass());
+        fake.failNext(Endpoint.GET, new Fault.Status(429, TOO_MANY_REQUESTS));
+
+        // when
+        ReceiptException thrown;
+        try {
+            thrown = assertThrows(ReceiptException.class, () -> interrupted.issue(request(uniqueKey())));
+        } finally {
+            // then: the interrupt flag is restored (and cleared here so it does not leak into other tests)
+            assertTrue(Thread.interrupted(), "the interrupt flag must be restored");
+        }
+        assertExactly(ReceiptException.class, thrown);
+        assertEquals(2, fake.requestLog().stream().filter(line -> line.startsWith("GET /invoices/1")).count(),
+                "no further read after the interrupted pause");
         assertEquals(0, fiscalPrintRequests());
     }
 
@@ -451,6 +519,93 @@ class FakturowniaReceiptProviderTest {
 
     private int fiscalPrintRequests() {
         return (int) fake.requestLog().stream().filter(line -> line.startsWith("GET /invoices/fiscal_print")).count();
+    }
+
+    @Test
+    void transient429OnClearMarkerIsRetried() {
+        // given: fiscal_print certainly did not run (401); the marker removal is rate-limited twice, then succeeds
+        ReceiptRequest request = request(uniqueKey());
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(401, "{\"code\":\"error\",\"message\":\"Unauthorized\"}"));
+        fake.failNext(Endpoint.UPDATE, new Fault.Pass());
+        fake.failNext(Endpoint.UPDATE, new Fault.Status(429, TOO_MANY_REQUESTS));
+        fake.failNext(Endpoint.UPDATE, new Fault.Status(429, TOO_MANY_REQUESTS));
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request));
+        String id = onlyInvoiceId();
+
+        // then
+        assertExactly(ReceiptException.class, thrown);
+        assertTrue(thrown.getMessage().contains("the marker was removed"), thrown.getMessage());
+        assertMarkerGone(id);
+        assertEquals(List.of(1000L, 2000L), sleeps);
+
+        // when
+        Receipt retried = provider.issue(request);
+
+        // then
+        assertEquals(ReceiptState.PENDING, retried.state());
+        assertEquals(1, fake.fiscalPrintCalls(id));
+        assertEquals(2, fiscalPrintRequests(), "the refused request and the one order");
+    }
+
+    @Test
+    void operatorNoteSurvivesTheMarker() {
+        // given: two receipts that already exist with the operator's private note
+        String ordered = uniqueKey();
+        String refused = uniqueKey();
+        storeReceipt(5001, ordered, OPERATOR_NOTE);
+        storeReceipt(5002, refused, OPERATOR_NOTE);
+
+        // when: the first is ordered, the second's fiscal_print is rate-limited
+        Receipt receipt = provider.issue(request(ordered));
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(429, TOO_MANY_REQUESTS));
+        assertExactly(ReceiptException.class, assertThrows(ReceiptException.class, () -> provider.issue(request(refused))));
+
+        // then
+        assertEquals(ReceiptState.PENDING, receipt.state());
+        String note = fake.invoice("5001").get("internal_note").asText();
+        assertTrue(note.contains(OPERATOR_NOTE), note);
+        assertTrue(note.contains(FakturowniaReceiptMapper.FISCAL_PRINT_MARKER), note);
+        assertEquals(OPERATOR_NOTE, fake.invoice("5002").get("internal_note").asText());
+        assertEquals(0, fake.createCalls());
+    }
+
+    @Test
+    void fullLookupPageIsInconclusiveAndCreatesNothing() {
+        // given: the oid filter matches 100 other receipts (substring matches), none with this exact key
+        String key = uniqueKey();
+        for (int i = 0; i < 100; i++) {
+            storeReceipt(6000 + i, key + "-" + i, null);
+        }
+
+        // when
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request(key)));
+
+        // then
+        assertExactly(ReceiptOutcomeUnknownException.class, thrown);
+        assertEquals(0, fake.createCalls());
+        assertEquals(0, fiscalPrintRequests());
+        assertThrows(ReceiptOutcomeUnknownException.class, () -> provider.find(key));
+    }
+
+    private void storeReceipt(long id, String key, String note) {
+        ObjectNode stored = new ObjectMapper().createObjectNode().put("id", id).put("kind", "receipt").put("oid", key)
+                .put("department_id", FakeFakturownia.DEPARTMENT_ID).put("status", "paid");
+        stored.putNull("e_receipt_view_url");
+        stored.putNull("fiscal_status");
+        if (note != null) {
+            stored.put("internal_note", note);
+        }
+        fake.putInvoice(stored);
+    }
+
+    private String onlyInvoiceId() {
+        assertEquals(1, fake.invoiceCount());
+        return fake.requestLog().stream().filter(line -> line.startsWith("GET /invoices/1")).findFirst()
+                .map(line -> line.substring("GET /invoices/".length(), line.indexOf(".json"))).orElseThrow();
+    }
+
+    private void assertMarkerGone(String id) {
+        assertFalse(FakturowniaReceiptMapper.hasFiscalPrintMarker(fake.invoice(id)), "marker still set: " + fake.invoice(id));
     }
 
     // ---- error classification -----------------------------------------------------------------------
@@ -861,6 +1016,5 @@ class FakturowniaReceiptProviderTest {
         // when / then
         assertEquals(38, shortNames.maxLineNameLength());
         assertTrue(shortNames.requiresBuyerEmail());
-        assertTrue(shortNames.pushesStatusUpdates());
     }
 }

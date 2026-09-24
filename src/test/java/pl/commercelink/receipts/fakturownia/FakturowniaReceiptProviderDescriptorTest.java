@@ -77,7 +77,6 @@ class FakturowniaReceiptProviderDescriptorTest {
         // then
         assertEquals(40, provider.maxLineNameLength());
         assertTrue(provider.requiresBuyerEmail());
-        assertTrue(provider.pushesStatusUpdates());
     }
 
     @Test

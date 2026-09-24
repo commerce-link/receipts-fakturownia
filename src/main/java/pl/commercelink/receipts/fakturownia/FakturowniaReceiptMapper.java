@@ -23,6 +23,7 @@ import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Translates between the receipts contract and Fakturownia documents: a {@link ReceiptRequest} into the
@@ -31,7 +32,10 @@ import java.util.Set;
  */
 final class FakturowniaReceiptMapper {
 
-    /** Written to {@code internal_note} right before fiscalisation is ordered; its presence means "never order again". */
+    /**
+     * Appended as its own line to {@code internal_note} right before fiscalisation is ordered (the operator's note
+     * is kept); its presence means "never order again".
+     */
     static final String FISCAL_PRINT_MARKER = "commercelink:fiscal-print-ordered";
 
     /**
@@ -102,9 +106,6 @@ final class FakturowniaReceiptMapper {
 
     private ObjectNode position(int index, ReceiptLine line) {
         requireSupportedKind(index, line.kind());
-        if (!line.unitGross().isPositive()) {
-            throw new ReceiptValidationException("line " + index + ": fiscal printers refuse a line worth 0 PLN; leave it out of the receipt");
-        }
         String name = lineName(line.name(), lineNameLength);
         if (name.isEmpty()) {
             throw new ReceiptValidationException("line " + index + ": name is empty after removing characters the fiscal module refuses");
@@ -225,6 +226,22 @@ final class FakturowniaReceiptMapper {
     /** Whether Fakturownia holds any fiscalisation state for the document: queued, printing, done or failed. */
     static boolean hasFiscalStatus(JsonNode document) {
         return text(document, "fiscal_status") != null;
+    }
+
+    /** The operator's private note with the marker on its own last line; the note alone is never lost. */
+    static String withMarker(String note) {
+        return note == null || note.isBlank() ? FISCAL_PRINT_MARKER : note + "\n" + FISCAL_PRINT_MARKER;
+    }
+
+    /** The note without the marker line, stripped; {@code ""} when nothing else is left. */
+    static String withoutMarker(String note) {
+        if (note == null) {
+            return "";
+        }
+        return note.lines()
+                .filter(line -> !line.strip().equals(FISCAL_PRINT_MARKER))
+                .collect(Collectors.joining("\n"))
+                .strip();
     }
 
     static boolean hasFiscalPrintMarker(JsonNode document) {

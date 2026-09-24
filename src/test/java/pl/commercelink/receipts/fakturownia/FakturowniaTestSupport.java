@@ -41,9 +41,14 @@ final class FakturowniaTestSupport {
         return config;
     }
 
+    /** A provider whose retry pauses return at once, so the tests never wait for the back-off. */
     static FakturowniaReceiptProvider provider(FakeFakturownia fake, String... extra) {
+        return provider(fake, millis -> { }, extra);
+    }
+
+    static FakturowniaReceiptProvider provider(FakeFakturownia fake, FakturowniaReceiptProvider.Sleeper sleeper, String... extra) {
         FakturowniaReceiptConfig config = FakturowniaReceiptConfig.from(config(fake, extra));
-        return new FakturowniaReceiptProvider(new FakturowniaReceiptsApi(config.apiUrl(), config.apiKey(), SHORT_TIMEOUT), config, CLOCK);
+        return new FakturowniaReceiptProvider(new FakturowniaReceiptsApi(config.apiUrl(), config.apiKey(), SHORT_TIMEOUT), config, CLOCK, sleeper);
     }
 
     static String uniqueKey() {
