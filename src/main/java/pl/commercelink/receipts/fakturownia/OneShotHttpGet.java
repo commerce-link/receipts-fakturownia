@@ -50,9 +50,11 @@ final class OneShotHttpGet {
     /**
      * Sends the request and reads the response. Throws {@link FakturowniaApiException} of kind {@code NOT_SENT}
      * when no request byte left this JVM (connect or TLS handshake failed) and {@code SENT_NO_ANSWER} when
-     * writing failed, or reading failed before any status line came back. Once a status line is read, the
-     * request has had its one and only effect and is never retried: any further read failure (headers or body)
-     * is not turned into an exception — that status is returned with an empty body instead.
+     * writing failed, or reading failed before the final (non-{@code 1xx}) status line came back — a {@code 1xx}
+     * is not an answer, so a connection that drops while it is being skipped, or before the status line that
+     * follows it, is {@code SENT_NO_ANSWER} too. Once the final status line is read, the request has had its one
+     * and only effect and is never retried: any further read failure (headers or body) is not turned into an
+     * exception — that status is returned with an empty body instead.
      */
     Response get(URI uri, Map<String, String> headers) {
         boolean https = "https".equalsIgnoreCase(uri.getScheme());
@@ -104,9 +106,11 @@ final class OneShotHttpGet {
     }
 
     /**
-     * Reads the status line (skipping any {@code 1xx} and its headers), then the rest of the response. Only a
-     * failure while reading a status line propagates as {@link IOException} (translated by {@link #get} into
-     * {@code SENT_NO_ANSWER}); once one is read, the caller must get that status back, never an exception.
+     * Reads the status line (skipping any {@code 1xx} and its headers), then the rest of the response. A
+     * {@code 1xx} is not an answer: a failure while reading any status line, or while skipping a {@code 1xx}'s
+     * headers, propagates as {@link IOException} (translated by {@link #get} into {@code SENT_NO_ANSWER}) —
+     * including a connection that drops after an interim {@code 1xx} but before the final status line. Only once
+     * the final (non-{@code 1xx}) status line is read must the caller get that status back, never an exception.
      */
     private static Response readResponse(InputStream in) throws IOException {
         int status = readStatusLine(in);

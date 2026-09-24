@@ -148,6 +148,20 @@ class OneShotHttpGetTest {
     }
 
     @Test
+    void connectionDroppedAfterAnInterimHundredContinueIsSentNoAnswer() throws IOException {
+        // given: a 1xx is not an answer, so a drop before the status line that follows it is SENT_NO_ANSWER too,
+        // even though a status line (the 100's own) was technically read
+        int port = rawServer("HTTP/1.1 100 Continue\r\n\r\n", new AtomicInteger(), new CopyOnWriteArrayList<>());
+
+        // when
+        FakturowniaApiException failure = assertThrows(FakturowniaApiException.class,
+                () -> client.get(URI.create("http://127.0.0.1:" + port + "/x"), Map.of()));
+
+        // then
+        assertEquals(FakturowniaApiException.Kind.SENT_NO_ANSWER, failure.kind());
+    }
+
+    @Test
     void bodyOver64KiBIsTruncatedNotFailed() throws IOException {
         // given
         String hugeBody = "x".repeat(70_000);
