@@ -1,7 +1,6 @@
 package pl.commercelink.receipts.fakturownia;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import pl.commercelink.provider.api.WebhookContext;
 import pl.commercelink.provider.api.WebhookExecutor;
 import pl.commercelink.provider.api.WebhookOutcome;
@@ -10,10 +9,13 @@ import pl.commercelink.receipts.api.Receipt;
 import pl.commercelink.receipts.api.ReceiptKeys;
 import pl.commercelink.receipts.api.ReceiptValidationException;
 
+import java.lang.System.Logger;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Clock;
 import java.time.Duration;
+
+import static java.lang.System.Logger.Level.WARNING;
 
 /**
  * Handles Fakturownia's {@code invoice:update} webhook. Fakturownia signs nothing: the only proof of origin is
@@ -27,7 +29,7 @@ final class FakturowniaReceiptWebhookExecutor implements WebhookExecutor<Receipt
 
     static final String REJECTED = "REJECTED";
 
-    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final Logger LOG = System.getLogger(FakturowniaReceiptWebhookExecutor.class.getName());
 
     private final Clock clock;
     private final Duration timeout;
@@ -45,7 +47,7 @@ final class FakturowniaReceiptWebhookExecutor implements WebhookExecutor<Receipt
     public WebhookOutcome<Receipt> execute(String payload, WebhookContext context) {
         JsonNode body;
         try {
-            body = payload == null ? null : JSON.readTree(payload);
+            body = payload == null ? null : FakturowniaJson.MAPPER.readTree(payload);
         } catch (Exception e) {
             body = null;
         }
@@ -83,6 +85,10 @@ final class FakturowniaReceiptWebhookExecutor implements WebhookExecutor<Receipt
             }
             return WebhookOutcome.of(FakturowniaReceiptMapper.toReceipt(document, clock), null);
         } catch (RuntimeException e) {
+            // Also catches a broken store configuration (FakturowniaReceiptConfig.from): the consumer sees
+            // an ordinary empty outcome and keeps polling, but the operator needs to see this in the logs.
+            String storeId = context.providerConfig() == null ? null : context.providerConfig().get(FakturowniaReceiptConfig.DEPARTMENT_ID);
+            LOG.log(WARNING, "Fakturownia receipt webhook failed for store " + storeId, e);
             return WebhookOutcome.empty();
         }
     }

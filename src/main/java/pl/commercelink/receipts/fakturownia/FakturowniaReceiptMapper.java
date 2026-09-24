@@ -1,7 +1,6 @@
 package pl.commercelink.receipts.fakturownia;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import pl.commercelink.receipts.api.FiscalData;
@@ -48,8 +47,6 @@ final class FakturowniaReceiptMapper {
     /** {@code fiscal_status} of a receipt the printer refused; Fakturownia never retries it on its own. */
     private static final String FISCAL_ERROR = "error";
 
-    private static final ObjectMapper JSON = new ObjectMapper();
-
     private final String departmentId;
     private final int lineNameLength;
 
@@ -75,7 +72,7 @@ final class FakturowniaReceiptMapper {
             paid = paid.plus(payment.amount());
         }
 
-        ObjectNode invoice = JSON.createObjectNode();
+        ObjectNode invoice = FakturowniaJson.MAPPER.createObjectNode();
         invoice.put("kind", "receipt");
         invoice.putNull("number");
         invoice.put("oid", request.receiptKey());
@@ -110,7 +107,7 @@ final class FakturowniaReceiptMapper {
         if (name.isEmpty()) {
             throw new ReceiptValidationException("line " + index + ": name is empty after removing characters the fiscal module refuses");
         }
-        ObjectNode position = JSON.createObjectNode();
+        ObjectNode position = FakturowniaJson.MAPPER.createObjectNode();
         position.put("name", name);
         if (line.sku() != null && !line.sku().isBlank()) {
             position.put("code", line.sku());

@@ -2,7 +2,6 @@ package pl.commercelink.receipts.fakturownia;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
@@ -42,7 +41,6 @@ class FakturowniaReceiptsApi {
 
     private static final HttpClient SHARED_CLIENT = HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT).build();
 
-    private final ObjectMapper json = new ObjectMapper();
     private final String baseUrl;
     private final String apiKey;
     private final Duration timeout;
@@ -55,7 +53,7 @@ class FakturowniaReceiptsApi {
 
     /** {@code POST /invoices.json}; returns the created document. */
     JsonNode createReceipt(ObjectNode invoice) {
-        ObjectNode body = json.createObjectNode();
+        ObjectNode body = FakturowniaJson.MAPPER.createObjectNode();
         body.set("invoice", invoice);
         return readJson(send(request("/invoices.json").POST(HttpRequest.BodyPublishers.ofString(write(body)))
                 .header("Content-Type", "application/json")));
@@ -89,8 +87,8 @@ class FakturowniaReceiptsApi {
 
     /** {@code PUT /invoices/{id}.json} replacing the private note. */
     void updateInternalNote(String id, String note) {
-        ObjectNode invoice = json.createObjectNode().put("internal_note", note);
-        ObjectNode body = json.createObjectNode();
+        ObjectNode invoice = FakturowniaJson.MAPPER.createObjectNode().put("internal_note", note);
+        ObjectNode body = FakturowniaJson.MAPPER.createObjectNode();
         body.set("invoice", invoice);
         send(request("/invoices/" + encode(id) + ".json").PUT(HttpRequest.BodyPublishers.ofString(write(body)))
                 .header("Content-Type", "application/json"));
@@ -148,7 +146,7 @@ class FakturowniaReceiptsApi {
 
     private JsonNode readJson(String body) {
         try {
-            JsonNode node = json.readTree(body);
+            JsonNode node = FakturowniaJson.MAPPER.readTree(body);
             if (node == null || node.isMissingNode()) {
                 throw FakturowniaApiException.sentNoAnswer("Empty response body from Fakturownia", null);
             }
@@ -160,7 +158,7 @@ class FakturowniaReceiptsApi {
 
     private String write(ObjectNode body) {
         try {
-            return json.writeValueAsString(body);
+            return FakturowniaJson.MAPPER.writeValueAsString(body);
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Cannot serialise request body", e);
         }

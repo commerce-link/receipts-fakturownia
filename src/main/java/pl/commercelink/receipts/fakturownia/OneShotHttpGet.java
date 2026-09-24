@@ -13,8 +13,6 @@ import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.LinkedHashMap;
-import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -23,12 +21,21 @@ import java.util.Map;
  * before answering ({@code java.net.http} via {@code ConnectionExpiredException}, {@code HttpURLConnection}
  * via its one-time retry), which here would fiscalise the sale twice. HTTPS uses the given socket factory with
  * host name verification.
+ *
+ * <p>The response is read as: a status line ({@code 1xx} is skipped and the next status line read instead),
+ * then headers (skipped — never inspected), then the body read until the connection closes, capped at
+ * {@link #MAX_BODY_BYTES}. {@code Content-Length} and chunked framing are both ignored: the request always
+ * sends {@code Connection: close}, so reading to EOF is correct either way and does not need to parse either
+ * framing.
  */
 final class OneShotHttpGet {
 
     record Response(int status, String body) {}
 
-    private static final int MAX_HEADER_BYTES = 64 * 1024;
+    /** Guards a single line (status or header) against a connection that never sends a CRLF. */
+    private static final int MAX_LINE_BYTES = 64 * 1024;
+    /** The body is capped, not failed, past this size: nothing this class reads is meant to be this large. */
+    private static final int MAX_BODY_BYTES = 64 * 1024;
 
     private final SSLSocketFactory tls;
     private final Duration connectTimeout;
@@ -41,9 +48,11 @@ final class OneShotHttpGet {
     }
 
     /**
-     * Sends the request and reads the whole response. Throws {@link FakturowniaApiException} of kind
-     * {@code NOT_SENT} when no request byte left this JVM (connect or TLS handshake failed) and
-     * {@code SENT_NO_ANSWER} when writing or reading failed afterwards. Any HTTP status is returned as-is.
+     * Sends the request and reads the response. Throws {@link FakturowniaApiException} of kind {@code NOT_SENT}
+     * when no request byte left this JVM (connect or TLS handshake failed) and {@code SENT_NO_ANSWER} when
+     * writing failed, or reading failed before any status line came back. Once a status line is read, the
+     * request has had its one and only effect and is never retried: any further read failure (headers or body)
+     * is not turned into an exception — that status is returned with an empty body instead.
      */
     Response get(URI uri, Map<String, String> headers) {
         boolean https = "https".equalsIgnoreCase(uri.getScheme());
@@ -94,7 +103,26 @@ final class OneShotHttpGet {
         return head.append("\r\n").toString();
     }
 
+    /**
+     * Reads the status line (skipping any {@code 1xx} and its headers), then the rest of the response. Only a
+     * failure while reading a status line propagates as {@link IOException} (translated by {@link #get} into
+     * {@code SENT_NO_ANSWER}); once one is read, the caller must get that status back, never an exception.
+     */
     private static Response readResponse(InputStream in) throws IOException {
+        int status = readStatusLine(in);
+        while (status / 100 == 1) {
+            skipHeaders(in);
+            status = readStatusLine(in);
+        }
+        try {
+            skipHeaders(in);
+            return new Response(status, new String(readBody(in), StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            return new Response(status, "");
+        }
+    }
+
+    private static int readStatusLine(InputStream in) throws IOException {
         String statusLine = readLine(in);
         if (statusLine == null) {
             throw new IOException("Connection closed before any response");
@@ -103,74 +131,29 @@ final class OneShotHttpGet {
         if (parts.length < 2 || !parts[0].startsWith("HTTP/")) {
             throw new IOException("Malformed status line: " + statusLine);
         }
-        int status;
         try {
-            status = Integer.parseInt(parts[1]);
+            return Integer.parseInt(parts[1]);
         } catch (NumberFormatException e) {
             throw new IOException("Malformed status line: " + statusLine, e);
         }
-        Map<String, String> responseHeaders = new LinkedHashMap<>();
-        int headerBytes = 0;
-        for (String line = readLine(in); line != null && !line.isEmpty(); line = readLine(in)) {
-            headerBytes += line.length();
-            if (headerBytes > MAX_HEADER_BYTES) {
-                throw new IOException("Response headers too large");
-            }
-            int colon = line.indexOf(':');
-            if (colon > 0) {
-                responseHeaders.put(line.substring(0, colon).strip().toLowerCase(Locale.ROOT), line.substring(colon + 1).strip());
-            }
-        }
-        byte[] body;
-        if ("chunked".equalsIgnoreCase(responseHeaders.get("transfer-encoding"))) {
-            body = readChunked(in);
-        } else if (responseHeaders.containsKey("content-length")) {
-            int contentLength;
-            try {
-                contentLength = Integer.parseInt(responseHeaders.get("content-length"));
-            } catch (NumberFormatException e) {
-                throw new IOException("Malformed Content-Length: " + responseHeaders.get("content-length"), e);
-            }
-            if (contentLength < 0) {
-                throw new IOException("Negative Content-Length: " + contentLength);
-            }
-            body = in.readNBytes(contentLength);
-            if (body.length != contentLength) {
-                throw new IOException("Truncated body: expected " + contentLength + " bytes, got " + body.length);
-            }
-        } else {
-            body = in.readAllBytes();
-        }
-        return new Response(status, new String(body, StandardCharsets.UTF_8));
     }
 
-    private static byte[] readChunked(InputStream in) throws IOException {
-        ByteArrayOutputStream body = new ByteArrayOutputStream();
-        while (true) {
-            String sizeLine = readLine(in);
-            if (sizeLine == null) {
-                throw new IOException("Truncated chunked body");
-            }
-            int semicolon = sizeLine.indexOf(';');
-            int size;
-            try {
-                size = Integer.parseInt((semicolon < 0 ? sizeLine : sizeLine.substring(0, semicolon)).strip(), 16);
-            } catch (NumberFormatException e) {
-                throw new IOException("Malformed chunk size: " + sizeLine, e);
-            }
-            if (size < 0) {
-                throw new IOException("Negative chunk size: " + size);
-            }
-            if (size == 0) {
-                return body.toByteArray();
-            }
-            byte[] chunk = in.readNBytes(size);
-            if (chunk.length != size) {
-                throw new IOException("Truncated chunk: expected " + size + " bytes, got " + chunk.length);
-            }
-            body.write(chunk);
-            readLine(in);
+    /** Headers are never inspected — framing is fixed, see the class comment — so they are only skipped over. */
+    private static void skipHeaders(InputStream in) throws IOException {
+        for (String line = readLine(in); line != null && !line.isEmpty(); line = readLine(in)) {
+            // intentionally discarded
         }
+    }
+
+    private static byte[] readBody(InputStream in) throws IOException {
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        int read;
+        while (body.size() < MAX_BODY_BYTES
+                && (read = in.read(buffer, 0, Math.min(buffer.length, MAX_BODY_BYTES - body.size()))) != -1) {
+            body.write(buffer, 0, read);
+        }
+        return body.toByteArray();
     }
 
     /** One CRLF- (or LF-) terminated line in ISO-8859-1, or null at end of stream before any byte. */
@@ -183,7 +166,7 @@ final class OneShotHttpGet {
                 return end > 0 && line.charAt(end - 1) == '\r' ? line.substring(0, end - 1) : line.toString();
             }
             line.append((char) b);
-            if (line.length() > MAX_HEADER_BYTES) {
+            if (line.length() > MAX_LINE_BYTES) {
                 throw new IOException("Line too long");
             }
         }

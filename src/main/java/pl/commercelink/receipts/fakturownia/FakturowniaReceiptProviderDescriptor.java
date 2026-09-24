@@ -39,6 +39,13 @@ public final class FakturowniaReceiptProviderDescriptor implements ReceiptProvid
 
     @Override
     public ReceiptProvider create(Map<String, String> configuration) {
+        // The shared JDK HttpClient must never resend POST/PUT: a resent fiscal_print-adjacent write (marking or
+        // ordering) would double an effect that is meant to happen at most once. Refuse to create the provider
+        // rather than risk that, since the property is process-wide and cannot be guarded per request.
+        if (Boolean.getBoolean("jdk.httpclient.enableAllMethodRetry")) {
+            throw new IllegalStateException(
+                    "jdk.httpclient.enableAllMethodRetry=true would resend POST/PUT to Fakturownia; refusing to create the receipt provider");
+        }
         FakturowniaReceiptConfig config = FakturowniaReceiptConfig.from(configuration);
         return new FakturowniaReceiptProvider(
                 new FakturowniaReceiptsApi(config.apiUrl(), config.apiKey(), FakturowniaReceiptsApi.DEFAULT_TIMEOUT),

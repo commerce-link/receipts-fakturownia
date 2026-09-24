@@ -93,4 +93,20 @@ class FakturowniaReceiptProviderDescriptorTest {
             assertTrue(failure.getMessage().contains(field), failure.getMessage());
         }
     }
+
+    @Test
+    void refusesToCreateAProviderWhenTheJdkWouldRetryMethods() {
+        // given: jdk.httpclient.enableAllMethodRetry=true would make the shared HttpClient resend the fiscal_print
+        // GET's cousins (POST/PUT to Fakturownia) after a dropped connection, risking a duplicate effect
+        System.setProperty("jdk.httpclient.enableAllMethodRetry", "true");
+        try {
+            // when
+            IllegalStateException failure = assertThrows(IllegalStateException.class, () -> descriptor.create(config()));
+
+            // then
+            assertTrue(failure.getMessage().contains("jdk.httpclient.enableAllMethodRetry"), failure.getMessage());
+        } finally {
+            System.clearProperty("jdk.httpclient.enableAllMethodRetry");
+        }
+    }
 }

@@ -118,9 +118,11 @@ class OneShotHttpGetTest {
     }
 
     @Test
-    void readsChunkedBody() throws IOException {
-        // given
-        int port = rawServer("HTTP/1.1 422 Unprocessable Entity\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n6;ext=1\r\n World\r\n0\r\n\r\n",
+    void chunkedBodyIsReturnedReadableWithoutDechunking() throws IOException {
+        // given: de-chunking is not required — the JSON error text only has to be readable in the raw body
+        String json = "{\"code\":\"oid_unique\",\"message\":\"Oid already taken\"}";
+        String chunked = Integer.toHexString(json.length()) + "\r\n" + json + "\r\n0\r\n\r\n";
+        int port = rawServer("HTTP/1.1 422 Unprocessable Entity\r\nTransfer-Encoding: chunked\r\n\r\n" + chunked,
                 new AtomicInteger(), new CopyOnWriteArrayList<>());
 
         // when
@@ -128,7 +130,59 @@ class OneShotHttpGetTest {
 
         // then
         assertEquals(422, response.status());
-        assertEquals("Hello World", response.body());
+        assertTrue(response.body().contains(json), response.body());
+    }
+
+    @Test
+    void hundredContinueIsSkippedAndTheFollowingStatusIsReported() throws IOException {
+        // given
+        int port = rawServer("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n\r\nqueued",
+                new AtomicInteger(), new CopyOnWriteArrayList<>());
+
+        // when
+        OneShotHttpGet.Response response = client.get(URI.create("http://127.0.0.1:" + port + "/x"), Map.of());
+
+        // then
+        assertEquals(200, response.status());
+        assertEquals("queued", response.body());
+    }
+
+    @Test
+    void bodyOver64KiBIsTruncatedNotFailed() throws IOException {
+        // given
+        String hugeBody = "x".repeat(70_000);
+        int port = rawServer("HTTP/1.1 200 OK\r\n\r\n" + hugeBody, new AtomicInteger(), new CopyOnWriteArrayList<>());
+
+        // when
+        OneShotHttpGet.Response response = client.get(URI.create("http://127.0.0.1:" + port + "/x"), Map.of());
+
+        // then
+        assertEquals(200, response.status());
+        assertEquals(64 * 1024, response.body().length());
+    }
+
+    @Test
+    void connectionResetMidBodyIsReportedWithTheStatusAlreadyRead() throws IOException {
+        // given: the status line was read, so the failure while reading the body must not become SENT_NO_ANSWER
+        ServerSocket server = new ServerSocket(0);
+        resources.add(server);
+        Thread.ofVirtual().start(() -> {
+            try (Socket socket = server.accept()) {
+                readHead(socket.getInputStream());
+                OutputStream out = socket.getOutputStream();
+                out.write("HTTP/1.1 200 OK\r\n\r\npartial".getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                socket.setSoLinger(true, 0); // close() below sends RST instead of FIN
+            } catch (IOException ignored) {
+                // server closed
+            }
+        });
+
+        // when
+        OneShotHttpGet.Response response = client.get(URI.create("http://127.0.0.1:" + server.getLocalPort() + "/x"), Map.of());
+
+        // then
+        assertEquals(200, response.status());
     }
 
     @Test
@@ -193,45 +247,6 @@ class OneShotHttpGetTest {
 
         // then
         assertEquals(FakturowniaApiException.Kind.NOT_SENT, failure.kind());
-    }
-
-    @Test
-    void truncatedContentLengthBodyIsSentNoAnswer() throws IOException {
-        // given
-        int port = rawServer("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort", new AtomicInteger(), new CopyOnWriteArrayList<>());
-
-        // when
-        FakturowniaApiException failure = assertThrows(FakturowniaApiException.class,
-                () -> client.get(URI.create("http://127.0.0.1:" + port + "/x"), Map.of()));
-
-        // then
-        assertEquals(FakturowniaApiException.Kind.SENT_NO_ANSWER, failure.kind());
-    }
-
-    @Test
-    void malformedContentLengthIsSentNoAnswer() throws IOException {
-        // given
-        int port = rawServer("HTTP/1.1 200 OK\r\nContent-Length: ten\r\n\r\nOK", new AtomicInteger(), new CopyOnWriteArrayList<>());
-
-        // when
-        FakturowniaApiException failure = assertThrows(FakturowniaApiException.class,
-                () -> client.get(URI.create("http://127.0.0.1:" + port + "/x"), Map.of()));
-
-        // then
-        assertEquals(FakturowniaApiException.Kind.SENT_NO_ANSWER, failure.kind());
-    }
-
-    @Test
-    void malformedChunkSizeIsSentNoAnswer() throws IOException {
-        // given
-        int port = rawServer("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n", new AtomicInteger(), new CopyOnWriteArrayList<>());
-
-        // when
-        FakturowniaApiException failure = assertThrows(FakturowniaApiException.class,
-                () -> client.get(URI.create("http://127.0.0.1:" + port + "/x"), Map.of()));
-
-        // then
-        assertEquals(FakturowniaApiException.Kind.SENT_NO_ANSWER, failure.kind());
     }
 
     // ---- TLS ---------------------------------------------------------------------------------------------

@@ -1,7 +1,6 @@
 package pl.commercelink.receipts.fakturownia;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -24,7 +23,7 @@ final class FakturowniaApiException extends RuntimeException {
         HTTP
     }
 
-    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final Pattern OID_TOKEN = Pattern.compile("(?<![A-Za-z0-9])oid(?![A-Za-z0-9])", Pattern.CASE_INSENSITIVE);
 
     private final Kind kind;
     private final int status;
@@ -92,38 +91,37 @@ final class FakturowniaApiException extends RuntimeException {
     }
 
     /**
-     * Whether the error body names this field, or a variant Fakturownia keys as {@code field_<suffix>}
+     * Whether the error body names the {@code oid} field, or a variant Fakturownia keys as {@code oid_<suffix>}
      * (e.g. {@code oid_unique} — the real key format is undocumented): a key of the object-shaped
-     * {@code message} equal to {@code field} or starting with {@code field + "_"}
-     * ({@code {"message":{"oid_unique":[…]}}}), or {@code field} as a standalone token (not preceded or
+     * {@code message} equal to {@code oid} or starting with {@code "oid_"}
+     * ({@code {"message":{"oid_unique":[…]}}}), or {@code oid} as a standalone token (not preceded or
      * followed by a letter or digit, so {@code oid_unique} and {@code oid:} match but {@code void} and
      * {@code oidx} do not) in a plain-text {@code message} or the raw body.
      */
-    boolean mentionsField(String field) {
+    boolean mentionsOid() {
         JsonNode message = parsedBody().path("message");
         if (message.isObject()) {
             Iterator<String> keys = message.fieldNames();
             while (keys.hasNext()) {
                 String key = keys.next();
-                if (key.equals(field) || key.startsWith(field + "_")) {
+                if (key.equals("oid") || key.startsWith("oid_")) {
                     return true;
                 }
             }
             return false;
         }
         String text = message.isTextual() ? message.asText() : body;
-        return text != null && Pattern.compile("(?<![A-Za-z0-9])" + Pattern.quote(field) + "(?![A-Za-z0-9])", Pattern.CASE_INSENSITIVE)
-                .matcher(text).find();
+        return text != null && OID_TOKEN.matcher(text).find();
     }
 
     private JsonNode parsedBody() {
         if (body == null || body.isBlank()) {
-            return JSON.missingNode();
+            return FakturowniaJson.MAPPER.missingNode();
         }
         try {
-            return JSON.readTree(body);
+            return FakturowniaJson.MAPPER.readTree(body);
         } catch (Exception e) {
-            return JSON.missingNode();
+            return FakturowniaJson.MAPPER.missingNode();
         }
     }
 }

@@ -65,9 +65,11 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
         ObjectNode invoice = mapper.toInvoice(request);
         String key = request.receiptKey();
 
-        String id = lookup(key)
-                .map(found -> toReceipt(found, true).providerReceiptId())
-                .orElseGet(() -> toReceipt(create(key, invoice), true).providerReceiptId());
+        JsonNode found = lookup(key).orElseGet(() -> create(key, invoice));
+        String id = FakturowniaReceiptMapper.text(found, "id");
+        if (id == null) {
+            throw new ReceiptOutcomeUnknownException("Fakturownia document without id: " + found);
+        }
 
         // Decide on the full document (GET /invoices/{id}.json), never on the list or create answer: only the
         // full document is documented to carry e_receipt_view_url, and the list may omit internal_note. A failed
@@ -232,7 +234,7 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
                 throw new ReceiptOutcomeUnknownException("Receipt " + key + " appeared while creating it (HTTP " + e.status()
                         + "); retry with the same key to resume", e);
             }
-            if (e.mentionsField("oid")) {
+            if (e.mentionsOid()) {
                 // A conflict on oid (oid_unique) proves a receipt under this key exists, even though the lookup
                 // cannot see it; a Rejected would make the consumer issue a second receipt for the same sale.
                 throw new ReceiptOutcomeUnknownException("Receipt " + key + " exists in Fakturownia (HTTP " + e.status()
