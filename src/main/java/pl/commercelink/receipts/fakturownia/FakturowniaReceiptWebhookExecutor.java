@@ -88,7 +88,7 @@ final class FakturowniaReceiptWebhookExecutor implements WebhookExecutor<Receipt
             // Also catches a broken store configuration (FakturowniaReceiptConfig.from): the consumer sees
             // an ordinary empty outcome and keeps polling, but the operator needs to see this in the logs.
             String departmentId = context.providerConfig() == null ? null : context.providerConfig().get(FakturowniaReceiptConfig.DEPARTMENT_ID);
-            LOG.log(WARNING, "Fakturownia receipt webhook failed for store " + departmentId, e);
+            LOG.log(WARNING, "Fakturownia receipt webhook failed for document " + id + " in department " + departmentId, e);
             return WebhookOutcome.empty();
         }
     }

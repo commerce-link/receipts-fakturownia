@@ -71,6 +71,8 @@ final class FakeFakturownia implements AutoCloseable {
     private int requests;
     private boolean listOmitsInternalNote;
     private boolean ignoreInternalNoteUpdates;
+    private boolean staleReadAfterNextUpdate;
+    private ObjectNode staleDocument;
     private boolean autoFiscalisation;
     private boolean queueOnMarker;
     private String statusBeforeFiscalPrint;
@@ -116,6 +118,14 @@ final class FakeFakturownia implements AutoCloseable {
     /** A PUT answers 200 but does not persist {@code internal_note} (whether receipts accept it is undocumented). */
     synchronized void ignoreInternalNoteUpdates() {
         ignoreInternalNoteUpdates = true;
+    }
+
+    /**
+     * The next PUT is persisted, but the GET that follows it still answers with the document as it was before
+     * that PUT (a lagging read replica), once.
+     */
+    synchronized void staleReadAfterNextUpdate() {
+        staleReadAfterNextUpdate = true;
     }
 
     /** The account option "Automatyczna fiskalizacja paragonów po utworzeniu przez API" is on: every new receipt is queued at once. */
@@ -330,6 +340,11 @@ final class FakeFakturownia implements AutoCloseable {
     }
 
     private Answer get(String id) {
+        if (staleDocument != null && id.equals(staleDocument.path("id").asText())) {
+            ObjectNode stale = staleDocument;
+            staleDocument = null;
+            return new Answer(200, stale.toString());
+        }
         ObjectNode invoice = invoices.get(id);
         return invoice == null ? notFound() : new Answer(200, invoice.toString());
     }
@@ -338,6 +353,10 @@ final class FakeFakturownia implements AutoCloseable {
         ObjectNode invoice = invoices.get(id);
         if (invoice == null) {
             return notFound();
+        }
+        if (staleReadAfterNextUpdate) {
+            staleReadAfterNextUpdate = false;
+            staleDocument = invoice.deepCopy();
         }
         ObjectNode applied = changes.deepCopy();
         if (ignoreInternalNoteUpdates) {

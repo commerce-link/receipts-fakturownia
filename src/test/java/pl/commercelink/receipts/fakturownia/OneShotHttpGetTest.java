@@ -225,6 +225,32 @@ class OneShotHttpGetTest {
     }
 
     @Test
+    void statusLineCutShortByADroppedConnectionIsSentNoAnswer() throws IOException {
+        // given: the connection drops inside the status line, so "4" must not be read as status 4
+        int port = rawServer("HTTP/1.1 4", new AtomicInteger(), new CopyOnWriteArrayList<>());
+
+        // when
+        FakturowniaApiException failure = assertThrows(FakturowniaApiException.class,
+                () -> client.get(URI.create("http://127.0.0.1:" + port + "/x"), Map.of()));
+
+        // then
+        assertEquals(FakturowniaApiException.Kind.SENT_NO_ANSWER, failure.kind());
+    }
+
+    @Test
+    void statusLineWithoutAThreeDigitCodeIsSentNoAnswer() throws IOException {
+        // given
+        int port = rawServer("HTTP/1.1 20 OK\r\n\r\nqueued", new AtomicInteger(), new CopyOnWriteArrayList<>());
+
+        // when
+        FakturowniaApiException failure = assertThrows(FakturowniaApiException.class,
+                () -> client.get(URI.create("http://127.0.0.1:" + port + "/x"), Map.of()));
+
+        // then
+        assertEquals(FakturowniaApiException.Kind.SENT_NO_ANSWER, failure.kind());
+    }
+
+    @Test
     void slowServerIsSentNoAnswer() throws IOException {
         // given
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);

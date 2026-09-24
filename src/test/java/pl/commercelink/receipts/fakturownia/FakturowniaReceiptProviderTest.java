@@ -343,8 +343,60 @@ class FakturowniaReceiptProviderTest {
         // then
         assertExactly(ReceiptException.class, thrown);
         assertTrue(thrown.getMessage().contains("could not be confirmed"), thrown.getMessage());
+        assertTrue(thrown.getMessage().contains("the marker was removed"), thrown.getMessage());
         assertEquals(0, fiscalPrintRequests());
         assertEquals(1, fake.createCalls());
+        String id = onlyInvoiceId();
+        assertMarkerGone(id);
+        assertEquals(List.of("PUT /invoices/" + id + ".json", "PUT /invoices/" + id + ".json",
+                        "PUT /invoices/" + id + ".json", "PUT /invoices/" + id + ".json"),
+                fake.requestLog().stream().filter(line -> line.startsWith("PUT ")).toList(),
+                "each call writes the marker and then removes it");
+    }
+
+    @Test
+    void staleConfirmingReadRemovesTheMarkerSoTheRetryOrdersOnce() {
+        // given: the marker PUT is persisted, but the confirming read still shows the document without it
+        ReceiptRequest request = request(uniqueKey());
+        fake.staleReadAfterNextUpdate();
+
+        // when
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request));
+        String id = onlyInvoiceId();
+
+        // then: nothing was ordered and the marker that did land is removed, so the retry is not stuck PENDING
+        assertExactly(ReceiptException.class, thrown);
+        assertTrue(thrown.getMessage().contains("could not be confirmed"), thrown.getMessage());
+        assertTrue(thrown.getMessage().contains("the marker was removed"), thrown.getMessage());
+        assertEquals(0, fiscalPrintRequests());
+        assertMarkerGone(id);
+
+        // when
+        Receipt retried = provider.issue(request);
+
+        // then
+        assertEquals(ReceiptState.PENDING, retried.state());
+        assertEquals(1, fake.fiscalPrintCalls(id));
+        assertEquals(1, fiscalPrintRequests());
+    }
+
+    @Test
+    void unconfirmedMarkerWhoseRemovalFailsSaysTheMarkerMayStayAndNothingIsOrdered() {
+        // given: the confirming read is stale and the removal fails (500 is not retried)
+        ReceiptRequest request = request(uniqueKey());
+        fake.staleReadAfterNextUpdate();
+        fake.failNext(Endpoint.UPDATE, new Fault.Pass());
+        fake.failNext(Endpoint.UPDATE, new Fault.Status(500, "boom"));
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request));
+
+        // when
+        Receipt retried = provider.issue(request);
+
+        // then: the marker is set, so the retry waits for the operator instead of ordering
+        assertExactly(ReceiptException.class, thrown);
+        assertTrue(thrown.getMessage().contains("the marker may stay"), thrown.getMessage());
+        assertEquals(ReceiptState.PENDING, retried.state());
+        assertEquals(0, fiscalPrintRequests());
     }
 
     @Test
@@ -422,7 +474,7 @@ class FakturowniaReceiptProviderTest {
 
         // then: the marker is most likely set, so the receipt waits for the operator instead of being ordered
         assertExactly(ReceiptException.class, thrown);
-        assertTrue(thrown.getMessage().contains("the marker stays"), thrown.getMessage());
+        assertTrue(thrown.getMessage().contains("the marker may stay"), thrown.getMessage());
         assertEquals(ReceiptState.PENDING, retried.state());
         assertEquals(0, fiscalPrintRequests());
     }
@@ -519,6 +571,23 @@ class FakturowniaReceiptProviderTest {
 
     private int fiscalPrintRequests() {
         return (int) fake.requestLog().stream().filter(line -> line.startsWith("GET /invoices/fiscal_print")).count();
+    }
+
+    @Test
+    void fiscalPrintThatDidNotRunWithAFailedMarkerRemovalSaysTheMarkerMayStay() {
+        // given: fiscal_print certainly did not run (401); the marker removal fails (500 is not retried)
+        ReceiptRequest request = request(uniqueKey());
+        fake.failNext(Endpoint.FISCAL_PRINT, new Fault.Status(401, "{\"code\":\"error\",\"message\":\"Unauthorized\"}"));
+        fake.failNext(Endpoint.UPDATE, new Fault.Pass());
+        fake.failNext(Endpoint.UPDATE, new Fault.Status(500, "boom"));
+
+        // when
+        ReceiptException thrown = assertThrows(ReceiptException.class, () -> provider.issue(request));
+
+        // then: the removal's answer may have been lost, so the message does not claim the marker certainly stays
+        assertExactly(ReceiptException.class, thrown);
+        assertTrue(thrown.getMessage().contains("the marker may stay"), thrown.getMessage());
+        assertEquals(0, fake.fiscalPrintCalls());
     }
 
     @Test

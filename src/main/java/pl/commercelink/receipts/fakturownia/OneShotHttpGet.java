@@ -22,9 +22,9 @@ import java.util.Map;
  * via its one-time retry), which here would fiscalise the sale twice. HTTPS uses the given socket factory with
  * host name verification.
  *
- * <p>The response is read as: a status line ({@code 1xx} is skipped and the next status line read instead),
- * then headers (skipped — never inspected), then the body read until the connection closes, capped at
- * {@link #MAX_BODY_BYTES}. {@code Content-Length} and chunked framing are both ignored: the request always
+ * <p>The response is read as: a complete status line (CRLF-terminated, with a three-digit code; {@code 1xx}
+ * is skipped and the next status line read instead), then headers (skipped — never inspected), then the body
+ * read until the connection closes, capped at {@link #MAX_BODY_BYTES}. {@code Content-Length} and chunked framing are both ignored: the request always
  * sends {@code Connection: close}, so reading to EOF is correct either way and does not need to parse either
  * framing.
  */
@@ -126,20 +126,36 @@ final class OneShotHttpGet {
         }
     }
 
+    /**
+     * A status line is accepted only when it is complete: terminated by CRLF and carrying a three-digit code. A
+     * line cut short by a dropped connection ({@code "HTTP/1.1 4"}) is not an answer and fails like no answer.
+     */
     private static int readStatusLine(InputStream in) throws IOException {
-        String statusLine = readLine(in);
-        if (statusLine == null) {
-            throw new IOException("Connection closed before any response");
+        StringBuilder line = new StringBuilder();
+        int b;
+        while ((b = in.read()) != -1) {
+            if (b == '\n') {
+                break;
+            }
+            line.append((char) b);
+            if (line.length() > MAX_LINE_BYTES) {
+                throw new IOException("Line too long");
+            }
         }
+        if (b == -1) {
+            throw new IOException(line.isEmpty() ? "Connection closed before any response"
+                    : "Connection closed inside the status line: " + line);
+        }
+        int end = line.length();
+        if (end == 0 || line.charAt(end - 1) != '\r') {
+            throw new IOException("Status line not terminated by CRLF: " + line);
+        }
+        String statusLine = line.substring(0, end - 1);
         String[] parts = statusLine.split(" ", 3);
-        if (parts.length < 2 || !parts[0].startsWith("HTTP/")) {
+        if (parts.length < 2 || !parts[0].startsWith("HTTP/") || !parts[1].matches("[0-9]{3}")) {
             throw new IOException("Malformed status line: " + statusLine);
         }
-        try {
-            return Integer.parseInt(parts[1]);
-        } catch (NumberFormatException e) {
-            throw new IOException("Malformed status line: " + statusLine, e);
-        }
+        return Integer.parseInt(parts[1]);
     }
 
     /** Headers are never inspected — framing is fixed, see the class comment — so they are only skipped over. */

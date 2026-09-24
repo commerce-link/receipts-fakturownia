@@ -98,8 +98,9 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
         }
         // Order fiscalisation only once the marker is confirmed by a fresh read, so a PUT that Fakturownia
         // accepted but did not persist can never lead to a second order on a retry. The read is retried on a
-        // rate limit; if it still fails, nothing was ordered, so the marker is removed and the retry orders. Only
-        // when the removal fails too does the marker stay, and the receipt then waits PENDING for the operator.
+        // rate limit; if it still fails, or answers without the marker (a stale read, or a PUT that was not
+        // persisted), nothing was ordered, so the marker is removed and the retry orders. Only when the removal
+        // fails too may the marker stay, and the receipt then waits PENDING for the operator.
         JsonNode marked;
         try {
             marked = withRetries(() -> api.getReceipt(id));
@@ -109,12 +110,18 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
                         + " fiscalisation was not ordered and the marker was removed, retry with the same key", e);
             }
             throw new ReceiptException("Confirming the fiscal-print marker of receipt " + id + " (fiscalisation was not"
-                    + " ordered) failed: " + e.getMessage() + "; removing the marker failed too, so the marker stays and"
-                    + " the receipt waits PENDING for the operator", e);
+                    + " ordered) failed: " + e.getMessage() + "; removing the marker failed too, so the marker may stay"
+                    + " and the receipt then waits PENDING for the operator", e);
         }
         if (!FakturowniaReceiptMapper.hasFiscalPrintMarker(marked)) {
-            throw new ReceiptException("The fiscal-print marker of receipt " + id
-                    + " could not be confirmed; fiscalisation was not ordered");
+            // The read may be stale and the marker may still land: remove it, or every retry would stay PENDING.
+            if (clearMarker(id, originalNote)) {
+                throw new ReceiptException("The fiscal-print marker of receipt " + id + " could not be confirmed;"
+                        + " fiscalisation was not ordered and the marker was removed, retry with the same key");
+            }
+            throw new ReceiptException("The fiscal-print marker of receipt " + id + " could not be confirmed;"
+                    + " fiscalisation was not ordered, but removing the marker failed, so the marker may stay and the"
+                    + " receipt then waits PENDING for the operator");
         }
         if (FakturowniaReceiptMapper.hasFiscalStatus(marked)) {
             // queued by someone else between the two reads
@@ -268,7 +275,8 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
             if (certainlyNotRun) {
                 String marker = clearMarker(id, originalNote)
                         ? "the marker was removed, retry with the same key"
-                        : "removing the marker failed, so the marker stays and the receipt waits PENDING for the operator";
+                        : "removing the marker failed, so the marker may stay and the receipt then waits PENDING for"
+                                + " the operator";
                 throw new ReceiptException("Ordering fiscalisation of receipt " + id + " did not run: " + e.getMessage()
                         + "; " + marker, e);
             }
@@ -313,7 +321,8 @@ public final class FakturowniaReceiptProvider implements ReceiptProvider {
     /**
      * Removes the marker once fiscalisation certainly was not ordered, restoring the operator's note as read before
      * the marker was written. Returns whether the removal was confirmed by Fakturownia; when it was not, the marker
-     * stays (or its removal is unknown) and the receipt remains PENDING until the operator fiscalises it by hand.
+     * may stay (the removal may have failed, or its answer been lost) and the receipt then remains PENDING until the
+     * operator fiscalises it by hand.
      */
     private boolean clearMarker(String id, String originalNote) {
         try {

@@ -39,15 +39,15 @@ If the printer or the module is off, the receipt stays pending, possibly for hou
 **Fiscalisation is ordered at most once.** A sale registered twice in fiscal memory cannot be undone, while a missing
 fiscalisation is fixed by one click in Fakturownia. So the marker is written *before* the order, and a retry that sees
 the marker never orders again. The marker must be confirmed by a fresh read before the order: if Fakturownia does not
-persist it, `issue` stops with `ReceiptException` and orders nothing; if that read shows a `fiscal_status`, the
+persist it (or the read is stale), `issue` removes the marker again, stops with `ReceiptException` and orders nothing; if that read shows a `fiscal_status`, the
 receipt was queued by someone else and is not ordered. If an order is lost after the marker, the receipt stays `PENDING` and the consumer's
 "pending too long" alert sends the operator to Fakturownia. `fiscal_print` is sent through a one-shot HTTP/1.1
 connection (`OneShotHttpGet`), because both JDK HTTP clients silently resend a GET when the server closes the
 connection before answering.
 
 Callers must not issue the same key concurrently. That includes a queue redelivering the message while the first
-`issue` still runs: `issue` makes up to twelve sequential calls (seven, plus two more tries each for the confirming
-read and the marker removal) with a 30 s timeout each — a retried try failed fast, on a 429 or within the 10 s
+`issue` still runs: `issue` makes up to eleven sequential calls (lookup, create, read and marker write, up to three
+tries of the confirming read, `fiscal_print`, and up to three tries of the marker removal) with a 30 s timeout each — a retried try failed fast, on a 429 or within the 10 s
 connect timeout — and pauses up to 6 s, so the consumer's queue visibility timeout must be at least 360 s (or be
 extended while issuing), and the consumer should hold a per-key lease. Two concurrent calls can both write the marker and both order fiscalisation.
 
@@ -102,12 +102,12 @@ unknown and the marker stays. `fiscal_print` is an undocumented UI-style route: 
 queued, so those leave the marker in place and the receipt waits as `PENDING` for the operator. A receipt that exists
 but cannot be found by `oid` stays `OutcomeUnknown` until the lookup finds it or the operator acts.
 
-Whenever fiscalisation certainly was not ordered — the confirming read after the marker failed, or `fiscal_print`
-was not sent or answered 401/403/404/429 — the adapter removes the marker again (restoring the operator's note) and
+Whenever fiscalisation certainly was not ordered — the confirming read after the marker failed or did not show the
+marker, or `fiscal_print` was not sent or answered 401/403/404/429 — the adapter removes the marker again (restoring the operator's note) and
 throws `ReceiptException`, so the retry with the same key orders fiscalisation. `fiscal_print` itself is never
 retried within one call. The removal is retried like the confirming read (three tries, 1 s and 2 s apart, only after
-a 429 or a request that was never sent); only if it still fails does the marker stay, the exception says so, and
-every retry returns `PENDING` without ordering, like a lost `fiscal_print` answer. The marker stays on purpose after
+a 429 or a request that was never sent); only if it still fails may the marker stay (the removal may also have
+landed with its answer lost), the exception says so, and every retry that sees the marker returns `PENDING` without ordering, like a lost `fiscal_print` answer. The marker stays on purpose after
 every ambiguous answer: a lost answer to the marker `PUT` (the marker is assumed set), and any answer to
 `fiscal_print` that may have come after the job was queued.
 
@@ -198,7 +198,9 @@ well — both are harmless because the executor only reads.
   lost answer to the marker write or to `fiscal_print`, a `fiscal_print` redirect or other unexpected status) or when
   removing it failed; whenever fiscalisation was certainly not ordered, the adapter removes it and the retry orders.
 - **Private note**: the adapter appends its marker as the last line of `internal_note` and keeps the operator's text,
-  also when it removes the marker. Edit the note freely, but never delete the marker line by hand.
+  also when it removes the marker. The removal writes back the note as it was read just before the marker was
+  added, so an edit made in the seconds while `issue` runs on that receipt is lost; edit the note otherwise as you
+  like, but never delete the marker line by hand.
 - **Lookup page full** (`ReceiptOutcomeUnknownException` "returned a full page"): 100 or more receipts matched the
   `oid` filter, so the adapter cannot tell whether the key exists and creates nothing. Search Fakturownia for the
   exact `oid`: if a receipt exists, handle it as above; escalate before issuing the sale any other way.
