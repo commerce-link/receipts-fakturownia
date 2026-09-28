@@ -81,10 +81,14 @@ final class FakturowniaReceiptMapper {
         invoice.put("sell_date", date);
         invoice.put("issue_date", date);
         invoice.put("currency", "PLN");
-        invoice.put("status", "paid");
-        invoice.put("paid", amount(paid));
-        invoice.put("paid_date", date);
-        invoice.put("payment_type", paymentType(request));
+        if (!request.payments().isEmpty()) {
+            // nothing paid yet: no status, amount or payment type at all, as in Fakturownia's own e-receipt example —
+            // the receipt stays "issued" and shows no payment form rather than an invented one
+            invoice.put("status", paid.equals(request.totalGross()) ? "paid" : "partial");
+            invoice.put("paid", amount(paid));
+            invoice.put("paid_date", date);
+            invoice.put("payment_type", paymentType(request));
+        }
         invoice.put("buyer_email", email.strip());
         String taxId = request.buyer().taxId();
         if (taxId != null && !taxId.isBlank()) {

@@ -175,6 +175,9 @@ well — both are harmless because the executor only reads.
   Gotówka/Karta/Przelew; any other text is printed as "INNA (text)" (Fakturownia help; to confirm on the printer's
   daily report).
   - Fakturownia records one payment type per document, so payments that map to different types are refused.
+  - `status`/`paid`/`paid_date`/`payment_type` follow what was actually paid: the full total → `paid`, part of it →
+    `partial` with the paid amount, nothing (no payments in the request) → none of these fields are sent, as in
+    Fakturownia's own e-receipt example, so the receipt stays `issued` and shows no payment form.
 - Line names: `&` → "i"; `^ % $ # @ *` removed (the printer refuses them with error [16]); whitespace collapsed; the
   name is cut to `lineNameLength`.
 - Buyer: `buyer_email` (required), `buyer_tax_no` when a tax id is given, no names. With a name, Fakturownia treats

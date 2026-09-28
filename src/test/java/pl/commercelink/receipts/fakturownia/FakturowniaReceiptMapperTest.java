@@ -174,6 +174,40 @@ class FakturowniaReceiptMapperTest {
     }
 
     @Test
+    void unpaidReceiptCarriesNoPaymentData() {
+        // given: nothing paid yet
+        ReceiptRequest request = base()
+                .line(ReceiptLine.goods("Mysz", BigDecimal.ONE, Money.ofGrosze(9999), VatRate.VAT_23))
+                .build();
+
+        // when
+        ObjectNode invoice = mapper.toInvoice(request);
+
+        // then
+        assertFalse(invoice.has("payment_type"));
+        assertFalse(invoice.has("status"));
+        assertFalse(invoice.has("paid"));
+        assertFalse(invoice.has("paid_date"));
+    }
+
+    @Test
+    void partlyPaidReceiptIsPartialWithThePaidAmount() {
+        // given
+        ReceiptRequest request = base()
+                .line(ReceiptLine.goods("Mysz", BigDecimal.ONE, Money.ofGrosze(9999), VatRate.VAT_23))
+                .payment(ReceiptPayment.of(PaymentForm.CARD, Money.ofGrosze(4000)))
+                .build();
+
+        // when
+        ObjectNode invoice = mapper.toInvoice(request);
+
+        // then
+        assertEquals("partial", invoice.get("status").asText());
+        assertEquals("40.00", invoice.get("paid").asText());
+        assertEquals("card", invoice.get("payment_type").asText());
+    }
+
+    @Test
     void splitPaymentOfTheSameFormIsOnePaymentType() {
         // given
         ReceiptRequest request = base()
